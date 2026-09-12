@@ -225,13 +225,24 @@ npx ruflo@latest doctor --fix
 
 ## Project: RelationshipManagementOS
 
-Greenfield app for managing relationships: people, interactions, follow-up
-cadences, and relationship health. Nothing is built yet; the first work is a
-SPARC specification, not code.
+Personal relationship manager, built with a VC microfund in mind. Tracks
+friends, family, and professional contacts; logs interactions; nudges
+follow-ups by cadence. The fund use case is keeping prospective LPs,
+deal-flow sources, founders, and co-investors warm and engaged, and surfacing
+who is going cold. Nothing is built yet; the first work is a SPARC
+specification, not code.
 
-### Stack
-<!-- TODO: fill in once decided (framework, database/ORM, auth, hosting). -->
-Pending. Check `npx ruflo memory search --query stack --namespace project`.
+### Stack (ADR-0001)
+- Next.js 15 App Router, TypeScript, Tailwind CSS
+- Postgres via Drizzle ORM; migrations checked into `/src/db/migrations`
+- Clerk for auth
+- Vercel for hosting
+- Vitest for unit tests, Playwright for e2e
+
+### Domain
+Person, Interaction, Cadence, Tag/Role (friend, prospective LP, deal source,
+founder, co-investor), Reminder, RelationshipHealth (recency vs cadence).
+Fund extras: LP prospect stage, deal-source quality, intro tracking.
 
 ### Layout
 - `/src` application code, `/tests` tests, `/docs` specs and ADRs, `/scripts` tooling

@@ -222,3 +222,29 @@ npx ruflo@latest doctor --fix
 > by default; `--ttl 0` to disable, `daemon status --all` to audit running daemons).
 
 **Agent tool** handles execution (agents, files, code, git). **MCP tools** handle coordination (swarm, memory, hooks). **CLI** is the same via Bash.
+
+## Project: RelationshipManagementOS
+
+Greenfield app for managing relationships: people, interactions, follow-up
+cadences, and relationship health. Nothing is built yet; the first work is a
+SPARC specification, not code.
+
+### Stack
+<!-- TODO: fill in once decided (framework, database/ORM, auth, hosting). -->
+Pending. Check `npx ruflo memory search --query stack --namespace project`.
+
+### Layout
+- `/src` application code, `/tests` tests, `/docs` specs and ADRs, `/scripts` tooling
+- Specs live in `/docs/specs/`, architecture decisions in `/docs/adr/`
+
+### Workflow
+1. New feature: `/sparc:spec-pseudocode` first, then `/sparc:architect`, then implement.
+2. Swarm only when a change touches 3+ files; otherwise edit directly.
+3. Before a task: `npx ruflo memory search --query "<keywords>" --namespace project`.
+4. After a feature: `npx ruflo hooks worker dispatch --trigger testgaps`; add `audit` for auth or data-access changes.
+5. Store decisions: `npx ruflo memory store --namespace project --key <topic> --value "<decision and why>"`.
+
+### Git
+- Develop on `claude/*` feature branches; never push to `main` directly.
+- Run the project's build and tests before every commit once they exist.
+- Never commit `.env*`, `.swarm/`, `ruvector.db`, or `.claude-flow/data/`.

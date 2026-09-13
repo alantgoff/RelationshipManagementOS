@@ -11,7 +11,7 @@ speed of iteration, a hosted deploy with minimal ops, and a schema that can
 grow from personal contacts to fund-specific roles.
 
 ## Decision
-- Next.js 15 (App Router) with TypeScript and Tailwind CSS.
+- Next.js (App Router, 16 at build time) with TypeScript and Tailwind CSS.
 - Postgres with Drizzle ORM; SQL migrations checked into the repo.
 - Clerk for authentication.
 - Vercel for hosting.

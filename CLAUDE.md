@@ -229,11 +229,21 @@ Personal relationship manager, built with a VC microfund in mind. Tracks
 friends, family, and professional contacts; logs interactions; nudges
 follow-ups by cadence. The fund use case is keeping prospective LPs,
 deal-flow sources, founders, and co-investors warm and engaged, and surfacing
-who is going cold. Nothing is built yet; the first work is a SPARC
-specification, not code.
+who is going cold. v1 is implemented per `docs/specs/0001-v1-core.md` and
+`docs/adr/0002-architecture.md`.
+
+### Commands
+```bash
+cp .env.example .env.local        # set DATABASE_URL; Clerk keys optional in dev
+npm run db:migrate                # apply src/db/migrations
+npm run dev                       # http://localhost:3000 (dev user when Clerk keys absent)
+npm run check                     # typecheck + lint + vitest (needs Postgres at TEST_DATABASE_URL or rmos_test)
+npm run build && npm run test:e2e # Playwright acceptance suite against a production build
+```
+Schema changes: edit `src/db/schema.ts`, then `npm run db:generate` and commit the SQL.
 
 ### Stack (ADR-0001)
-- Next.js 15 App Router, TypeScript, Tailwind CSS
+- Next.js 16 App Router, TypeScript, Tailwind CSS (ADR-0002 notes the bump from 15)
 - Postgres via Drizzle ORM; migrations checked into `/src/db/migrations`
 - Clerk for auth
 - Vercel for hosting

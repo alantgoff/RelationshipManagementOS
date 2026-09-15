@@ -170,10 +170,11 @@
     ],
     "deny": [
       "Read(./.env)",
-      "Read(./.env.*)"
+      "Read(./.env.*)",
+      "Read(./.swarm/**)",
+      "Read(./ruvector.db)"
     ]
   },
-  "model": "claude-sonnet-5",
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "CLAUDE_FLOW_V3_ENABLED": "true",

@@ -222,3 +222,50 @@ npx ruflo@latest doctor --fix
 > by default; `--ttl 0` to disable, `daemon status --all` to audit running daemons).
 
 **Agent tool** handles execution (agents, files, code, git). **MCP tools** handle coordination (swarm, memory, hooks). **CLI** is the same via Bash.
+
+## Project: RelationshipManagementOS
+
+Personal relationship manager, built with a VC microfund in mind. Tracks
+friends, family, and professional contacts; logs interactions; nudges
+follow-ups by cadence. The fund use case is keeping prospective LPs,
+deal-flow sources, founders, and co-investors warm and engaged, and surfacing
+who is going cold. v1 is implemented per `docs/specs/0001-v1-core.md` and
+`docs/adr/0002-architecture.md`.
+
+### Commands
+```bash
+cp .env.example .env.local        # set DATABASE_URL; Clerk keys optional in dev
+npm run db:migrate                # apply src/db/migrations
+npm run dev                       # http://localhost:3000 (dev user when Clerk keys absent)
+npm run check                     # typecheck + lint + vitest (needs Postgres at TEST_DATABASE_URL or rmos_test)
+npm run build && npm run test:e2e # Playwright acceptance suite against a production build
+```
+Schema changes: edit `src/db/schema.ts`, then `npm run db:generate` and commit the SQL.
+
+### Stack (ADR-0001)
+- Next.js 16 App Router, TypeScript, Tailwind CSS (ADR-0002 notes the bump from 15)
+- Postgres via Drizzle ORM; migrations checked into `/src/db/migrations`
+- Clerk for auth
+- Vercel for hosting
+- Vitest for unit tests, Playwright for e2e
+
+### Domain
+Person, Interaction, Cadence, Tag/Role (friend, prospective LP, deal source,
+founder, co-investor), Reminder, RelationshipHealth (recency vs cadence).
+Fund extras: LP prospect stage, deal-source quality, intro tracking.
+
+### Layout
+- `/src` application code, `/tests` tests, `/docs` specs and ADRs, `/scripts` tooling
+- Specs live in `/docs/specs/`, architecture decisions in `/docs/adr/`
+
+### Workflow
+1. New feature: `/sparc:spec-pseudocode` first, then `/sparc:architect`, then implement.
+2. Swarm only when a change touches 3+ files; otherwise edit directly.
+3. Before a task: `npx ruflo memory search --query "<keywords>" --namespace project`.
+4. After a feature: `npx ruflo hooks worker dispatch --trigger testgaps`; add `audit` for auth or data-access changes.
+5. Store decisions: `npx ruflo memory store --namespace project --key <topic> --value "<decision and why>"`.
+
+### Git
+- Develop on `claude/*` feature branches; never push to `main` directly.
+- Run the project's build and tests before every commit once they exist.
+- Never commit `.env*`, `.swarm/`, `ruvector.db`, or `.claude-flow/data/`.

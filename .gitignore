@@ -65,3 +65,6 @@ playwright-report/
 
 # Keep the example env checked in
 !.env.example
+
+# Agent eval results (local runs)
+.eval-results/

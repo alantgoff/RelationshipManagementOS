@@ -22,6 +22,8 @@ test.describe("v1 acceptance criteria", () => {
 
     await page.getByRole("link", { name: "People" }).click();
     await page.getByRole("link", { name }).click();
+    await page.waitForURL(/\/people\/[0-9a-f-]{36}$/);
+    await expect(page.getByRole("heading", { level: 1 })).toContainText(name);
     await expect(page.locator("[data-health=fresh]")).toBeVisible();
   });
 

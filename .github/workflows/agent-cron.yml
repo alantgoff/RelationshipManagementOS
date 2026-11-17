@@ -1,0 +1,27 @@
+name: Agent tick
+
+# Calls the app's tick endpoint every 15 minutes so morning briefs go out in
+# each owner's local time. Free on GitHub Actions; Vercel Hobby cron only runs
+# daily. Needs repository secrets APP_URL (e.g. https://your-app.vercel.app)
+# and CRON_SECRET (same value as the app's CRON_SECRET). Scheduled workflows
+# only run on the default branch.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call the tick endpoint
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "APP_URL or CRON_SECRET is not set; skipping."
+            exit 0
+          fi
+          curl -fsS --max-time 120 -H "Authorization: Bearer $CRON_SECRET" "$APP_URL/api/cron/tick"

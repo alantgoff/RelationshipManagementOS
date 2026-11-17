@@ -46,9 +46,17 @@ export async function updatePerson(id: string, raw: PersonInput): Promise<void> 
   revalidateApp([`/people/${id}`]);
 }
 
-export async function setLpStage(id: string, stage: LpStage | null): Promise<void> {
+/**
+ * Set a person's LP stage, and optionally their commitment in whole USD.
+ * Setting a stage on someone without an LP role adds `prospective_lp`;
+ * `committed` also adds `committed_lp`.
+ */
+export async function setLpStage(id: string, stage: LpStage | null, commitmentUsd?: number | null): Promise<void> {
   const userId = await requireUserId();
   uuid.parse(id);
+  if (commitmentUsd != null && (!Number.isFinite(commitmentUsd) || commitmentUsd < 0)) {
+    throw new Error("Commitment must be a positive amount");
+  }
   const db = getDb();
   const [row] = await db
     .select({ roles: people.roles })
@@ -56,10 +64,16 @@ export async function setLpStage(id: string, stage: LpStage | null): Promise<voi
     .where(and(eq(people.id, id), eq(people.userId, userId)));
   if (!row) throw new Error("Person not found");
   const roles = [...row.roles];
+  if (stage && !roles.includes("prospective_lp") && !roles.includes("committed_lp")) roles.push("prospective_lp");
   if (stage === "committed" && !roles.includes("committed_lp")) roles.push("committed_lp");
   await db
     .update(people)
-    .set({ lpStage: stage, roles, updatedAt: new Date() })
+    .set({
+      lpStage: stage,
+      roles,
+      ...(commitmentUsd !== undefined ? { lpCommitmentUsd: commitmentUsd === null ? null : Math.round(commitmentUsd) } : {}),
+      updatedAt: new Date(),
+    })
     .where(and(eq(people.id, id), eq(people.userId, userId)));
   revalidateApp([`/people/${id}`]);
 }

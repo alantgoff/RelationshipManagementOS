@@ -1,5 +1,7 @@
 import { relations, sql } from "drizzle-orm";
 import {
+  bigint,
+  boolean,
   index,
   integer,
   jsonb,
@@ -41,6 +43,8 @@ export const people = pgTable(
     cadenceDays: integer("cadence_days"),
     lpStage: lpStageEnum("lp_stage"),
     dealSourceQuality: dealSourceQualityEnum("deal_source_quality"),
+    /** Committed or soft-circled amount for LPs, in whole US dollars. */
+    lpCommitmentUsd: bigint("lp_commitment_usd", { mode: "number" }),
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     ...timestamps,
   },
@@ -132,8 +136,174 @@ export const userSettings = pgTable("user_settings", {
   timezone: text("timezone").notNull().default("UTC"),
   /** Per-role cadence overrides, e.g. { "prospective_lp": 14 } */
   defaultCadences: jsonb("default_cadences").$type<Record<string, number>>().notNull().default({}),
+  /** Agent: whether it may send unprompted messages (briefs, nudges). `stop` turns this off. */
+  proactiveEnabled: boolean("proactive_enabled").notNull().default(true),
+  /** Agent: unprompted messages are held until this time (`pause 2h`). */
+  pausedUntil: timestamp("paused_until", { withTimezone: true }),
+  /** Agent: local time of the weekday morning brief, HH:MM. */
+  briefTime: text("brief_time").notNull().default("07:30"),
+  /** Agent: quiet hours in local time, HH:MM; may wrap past midnight. */
+  quietStart: text("quiet_start").notNull().default("21:00"),
+  quietEnd: text("quiet_end").notNull().default("07:00"),
+  /** Agent: at most this many unprompted messages per local day. */
+  dailyUnpromptedLimit: integer("daily_unprompted_limit").notNull().default(3),
   ...timestamps,
 });
+
+/* ───────────────────────── Headless agent (spec 0002) ───────────────────────── */
+
+/** One messaging line per owner. The phone is set only after the owner texts the binding code. */
+export const channelBindings = pgTable(
+  "channel_bindings",
+  {
+    userId: text("user_id").primaryKey(),
+    provider: text("provider").notNull(),
+    /** Owner's phone in E.164, set when verified. */
+    phone: text("phone"),
+    pendingCodeHash: text("pending_code_hash"),
+    codeExpiresAt: timestamp("code_expires_at", { withTimezone: true }),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (t) => [uniqueIndex("channel_bindings_phone_idx").on(t.phone), index("channel_bindings_code_idx").on(t.pendingCodeHash)],
+);
+
+export interface StoredMedia {
+  kind: "audio" | "image" | "contact" | "file";
+  contentType?: string;
+  /** Transcript, description or parsed card; provider URLs expire, so the binary is not kept. */
+  derivedText?: string;
+  error?: string;
+}
+
+/** Every message on the line, both directions. Bodies are encrypted (src/lib/crypto.ts). */
+export const channelMessages = pgTable(
+  "channel_messages",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    provider: text("provider").notNull(),
+    providerMessageId: text("provider_message_id"),
+    direction: text("direction", { enum: ["in", "out"] }).notNull(),
+    /** chat | command | brief | draft | system */
+    kind: text("kind").notNull().default("chat"),
+    bodyEnc: text("body_enc").notNull(),
+    media: jsonb("media").$type<StoredMedia[]>().notNull().default([]),
+    processedAt: timestamp("processed_at", { withTimezone: true }),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("channel_messages_provider_msg_idx").on(t.provider, t.providerMessageId),
+    index("channel_messages_user_created_idx").on(t.userId, t.createdAt),
+  ],
+);
+
+/** One agent turn: an inbound message and everything the agent did for it. */
+export const agentTurns = pgTable(
+  "agent_turns",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    inboundMessageId: uuid("inbound_message_id").references(() => channelMessages.id, { onDelete: "set null" }),
+    model: text("model"),
+    provider: text("provider"),
+    contextTokens: integer("context_tokens"),
+    steps: integer("steps").notNull().default(0),
+    latencyMs: integer("latency_ms"),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_turns_user_created_idx").on(t.userId, t.createdAt)],
+);
+
+/** Each tool call, with how to reverse it. Powers `undo` and `why`. */
+export const agentActions = pgTable(
+  "agent_actions",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    turnId: uuid("turn_id")
+      .notNull()
+      .references(() => agentTurns.id, { onDelete: "cascade" }),
+    tool: text("tool").notNull(),
+    input: jsonb("input").$type<Record<string, unknown>>().notNull().default({}),
+    ok: boolean("ok").notNull(),
+    summary: text("summary").notNull(),
+    undo: jsonb("undo").$type<Record<string, unknown> | null>(),
+    undoneAt: timestamp("undone_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("agent_actions_turn_idx").on(t.turnId), index("agent_actions_user_created_idx").on(t.userId, t.createdAt)],
+);
+
+/** Things that would reach another person. The owner approves each one (HA-6). */
+export const pendingActions = pgTable(
+  "pending_actions",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    kind: text("kind").notNull().default("message_draft"),
+    personId: uuid("person_id")
+      .notNull()
+      .references(() => people.id, { onDelete: "cascade" }),
+    channel: text("channel").notNull(),
+    bodyEnc: text("body_enc").notNull(),
+    /** pending | approved | rejected | expired */
+    status: text("status").notNull().default("pending"),
+    turnId: uuid("turn_id").references(() => agentTurns.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  },
+  (t) => [index("pending_actions_user_status_idx").on(t.userId, t.status)],
+);
+
+/** Durable facts with provenance. Superseded facts get valid_to set; nothing is deleted. */
+export const memoryFacts = pgTable(
+  "memory_facts",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    /** Null means a fact about the owner. */
+    personId: uuid("person_id").references(() => people.id, { onDelete: "cascade" }),
+    fact: text("fact").notNull(),
+    /** message | web | import */
+    sourceKind: text("source_kind").notNull(),
+    sourceId: text("source_id"),
+    validFrom: timestamp("valid_from", { withTimezone: true }).notNull().defaultNow(),
+    validTo: timestamp("valid_to", { withTimezone: true }),
+    supersededBy: uuid("superseded_by"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("memory_facts_user_person_idx").on(t.userId, t.personId)],
+);
+
+/** Rolling summary of the conversation before the recent window. */
+export const threadSummaries = pgTable("thread_summaries", {
+  userId: text("user_id").primaryKey(),
+  summaryEnc: text("summary_enc").notNull(),
+  /** created_at of the newest message folded into the summary. */
+  coversThrough: timestamp("covers_through", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Unprompted messages sent, for the daily budget and brief idempotency (HA-8). */
+export const notificationLog = pgTable(
+  "notification_log",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    /** brief | nudge */
+    kind: text("kind").notNull(),
+    localDate: text("local_date").notNull(),
+    messageId: uuid("message_id").references(() => channelMessages.id, { onDelete: "set null" }),
+    sentAt: timestamp("sent_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("notification_log_brief_once_idx").on(t.userId, t.kind, t.localDate).where(sql`kind = 'brief'`),
+    index("notification_log_user_date_idx").on(t.userId, t.localDate),
+  ],
+);
 
 export const peopleRelations = relations(people, ({ many }) => ({
   interactions: many(interactions, { relationName: "personInteractions" }),
@@ -177,3 +347,8 @@ export type Interaction = typeof interactions.$inferSelect;
 export type FollowUp = typeof followUps.$inferSelect;
 export type Reminder = typeof reminders.$inferSelect;
 export type UserSettings = typeof userSettings.$inferSelect;
+export type ChannelBinding = typeof channelBindings.$inferSelect;
+export type ChannelMessage = typeof channelMessages.$inferSelect;
+export type AgentAction = typeof agentActions.$inferSelect;
+export type PendingAction = typeof pendingActions.$inferSelect;
+export type MemoryFact = typeof memoryFacts.$inferSelect;

@@ -28,28 +28,29 @@ export interface ToolScenario {
 export const EVAL_TODAY = "2026-09-24";
 export const EVAL_WEEKDAY = "Thursday";
 
-export const EVAL_WORKING_SET = `People:
-- Priya Patel (id p_priya): prospective LP, stage first_meeting, last contact 2026-08-10, cadence 21d
-- Raj Mehta (id p_raj): founder of Acme Robotics, last contact 2026-09-01
-- Sarah Chen (id p_sarah): deal source, scout at Sequoia
-- Leo Park (id p_leo): co-investor at Northstar Ventures
-- Dana Lee (id p_dana): friend
-Open follow-ups:
-- f_deck: "Send Fund I deck to Priya Patel", due 2026-09-25`;
+export const EVAL_WORKING_SET = `People in play (mentioned recently):
+- Priya Patel [a1b2c3d4] · Prospective LP · Partner at Halcyon Family Office · due, last contact 2026-08-10, every 21d · LP stage First meeting
+- Raj Mehta [b2c3d4e5] · Founder · CEO at Acme Robotics · warm, last contact 2026-09-01, every 45d
+- Sarah Chen [c3d4e5f6] · Deal source · Scout at Sequoia · fresh, last contact 2026-09-20, every 30d
+- Leo Park [d4e5f6a7] · Co-investor · Partner at Northstar Ventures · warm, last contact 2026-08-30, every 60d
+- Dana Lee [e5f6a7b8] · Friend · cold, last contact 2026-06-02, every 45d
+
+Due:
+- follow-up [f6a7b8c9] Send Fund I deck to Priya → Priya Patel, due 2026-09-25`;
 
 export const TOOL_SCENARIOS: readonly ToolScenario[] = [
   {
     id: "log-coffee",
     message: "Had coffee with Priya this morning, she's keen on Fund I",
     expectTool: ["log_interaction"],
-    expectArgs: { person_id: "p_priya", type: { oneOf: ["meeting", "event"] }, summary: { present: true } },
+    expectArgs: { person_id: "a1b2c3d4", type: { oneOf: ["meeting", "event"] }, summary: { present: true } },
   },
   {
     id: "log-call-with-promise",
     message: "Call with Raj yesterday about his seed round. I promised to send him 3 angel intros by Friday",
     expectTool: ["log_interaction"],
     expectArgs: {
-      person_id: "p_raj",
+      person_id: "b2c3d4e5",
       type: "call",
       occurred_on: "2026-09-23",
       "follow_ups.0.due_on": "2026-09-25",
@@ -60,7 +61,7 @@ export const TOOL_SCENARIOS: readonly ToolScenario[] = [
     id: "what-do-i-know",
     message: "What do I know about Sarah?",
     expectTool: ["get_person"],
-    expectArgs: { person_id: "p_sarah" },
+    expectArgs: { person_id: "c3d4e5f6" },
   },
   {
     id: "unknown-person-search-first",
@@ -72,25 +73,25 @@ export const TOOL_SCENARIOS: readonly ToolScenario[] = [
     id: "birthday-reminder",
     message: "Remind me about Dana's birthday on October 8",
     expectTool: ["set_reminder"],
-    expectArgs: { person_id: "p_dana", due_on: "2026-10-08", reason: { includes: "birthday" } },
+    expectArgs: { person_id: "e5f6a7b8", due_on: "2026-10-08", reason: { includes: "birthday" } },
   },
   {
     id: "soft-circle",
     message: "Priya soft circled 250k!",
     expectTool: ["set_lp_stage"],
-    expectArgs: { person_id: "p_priya", stage: "soft_commit", commitment_usd: 250000 },
+    expectArgs: { person_id: "a1b2c3d4", stage: "soft_commit", commitment_usd: 250000 },
   },
   {
     id: "job-change",
     message: "Sarah moved to Benchmark",
     expectTool: ["update_person", "remember"],
-    expectArgs: { person_id: "p_sarah" },
+    expectArgs: { person_id: "c3d4e5f6" },
   },
   {
     id: "draft-not-send",
     message: "Draft a note to Leo asking if he wants to co-invest in Acme",
     expectTool: ["draft_message"],
-    expectArgs: { person_id: "p_leo", intent: { present: true } },
+    expectArgs: { person_id: "d4e5f6a7", intent: { present: true }, body: { present: true } },
   },
   { id: "small-talk", message: "thanks!", expectTool: null },
   {
@@ -103,16 +104,16 @@ export const TOOL_SCENARIOS: readonly ToolScenario[] = [
     message: "Introduced Raj to Leo over email today",
     expectTool: ["log_interaction"],
     expectArgs: {
-      person_id: { oneOf: ["p_raj", "p_leo"] },
+      person_id: { oneOf: ["b2c3d4e5", "d4e5f6a7"] },
       type: "intro",
-      introduced_person_id: { oneOf: ["p_raj", "p_leo"] },
+      introduced_person_id: { oneOf: ["b2c3d4e5", "d4e5f6a7"] },
     },
   },
   {
     id: "preference-fact",
     message: "Raj hates phone calls, text only",
     expectTool: ["remember", "update_person"],
-    expectArgs: { person_id: "p_raj" },
+    expectArgs: { person_id: "b2c3d4e5" },
   },
   {
     id: "list-lps",
@@ -124,13 +125,13 @@ export const TOOL_SCENARIOS: readonly ToolScenario[] = [
     id: "deal-source-quality",
     message: "Mark Sarah as a high quality deal source",
     expectTool: ["update_person"],
-    expectArgs: { person_id: "p_sarah", deal_source_quality: "high" },
+    expectArgs: { person_id: "c3d4e5f6", deal_source_quality: "high" },
   },
   {
     id: "relative-date-follow-up",
     message: "Follow up with Dana in 2 weeks about the ski trip",
     expectTool: ["add_follow_up", "set_reminder"],
-    expectArgs: { person_id: "p_dana", due_on: "2026-10-08" },
+    expectArgs: { person_id: "e5f6a7b8", due_on: "2026-10-08" },
   },
   {
     id: "week-plate",
@@ -146,12 +147,12 @@ export const TOOL_SCENARIOS: readonly ToolScenario[] = [
     id: "lp-passed",
     message: "Priya passed on Fund I :(",
     expectTool: ["set_lp_stage"],
-    expectArgs: { person_id: "p_priya", stage: "passed" },
+    expectArgs: { person_id: "a1b2c3d4", stage: "passed" },
   },
   {
     id: "scheduling-preference",
     message: "Leo prefers Tuesday mornings for calls",
     expectTool: ["remember", "update_person", "log_interaction"],
-    expectArgs: { person_id: "p_leo" },
+    expectArgs: { person_id: "d4e5f6a7" },
   },
 ];

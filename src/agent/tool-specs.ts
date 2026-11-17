@@ -70,11 +70,12 @@ export const toolSchemas = {
     }),
   },
   add_follow_up: {
-    description: "Add a promise the owner made to a person, not tied to a new interaction.",
+    description:
+      "Add a promise the owner made to a person when nothing new happened with them (stored as a dated reminder; defaults to one week out). If they just talked, use log_interaction with follow_ups instead.",
     input: z.object({ person_id: personId, description: z.string().min(1), due_on: isoDate.optional() }),
   },
   complete_follow_up: {
-    description: "Mark a follow-up as done.",
+    description: "Mark a follow-up or reminder as done, by the id shown in the working set or in get_person.",
     input: z.object({ follow_up_id: z.string().min(1) }),
   },
   set_reminder: {
@@ -106,11 +107,12 @@ export const toolSchemas = {
   },
   draft_message: {
     description:
-      "Draft a message to someone for the owner to approve. Never sends. The owner confirms with a thumbs up or 'send'.",
+      "Draft a message to someone, written in the owner's voice, for the owner to send themselves. Never sends anything. The draft is shown to the owner; they reply 👍 after sending it so it gets logged.",
     input: z.object({
       person_id: personId,
       channel: z.enum(["imessage", "email", "linkedin"]),
       intent: z.string().min(1).describe("What the message should accomplish"),
+      body: z.string().min(1).max(2000).describe("The full draft text, ready to send. For email, start with a 'Subject:' line."),
     }),
   },
 } as const;

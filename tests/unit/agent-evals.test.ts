@@ -31,8 +31,8 @@ describe("tool specs", () => {
   });
 
   it("validate arguments against the tool schema", () => {
-    expect(validateToolInput("set_reminder", { person_id: "p1", due_on: "2026-10-08", reason: "bday" }).success).toBe(true);
-    expect(validateToolInput("set_reminder", { person_id: "p1", due_on: "Oct 8", reason: "bday" }).success).toBe(false);
+    expect(validateToolInput("set_reminder", { person_id: "a1b2c3d4", due_on: "2026-10-08", reason: "bday" }).success).toBe(true);
+    expect(validateToolInput("set_reminder", { person_id: "a1b2c3d4", due_on: "Oct 8", reason: "bday" }).success).toBe(false);
   });
 });
 
@@ -50,7 +50,7 @@ describe("matches", () => {
     expect(matches(250000, 250000)).toBe(true);
     expect(matches("Tom Becker", { includes: "tom" })).toBe(true);
     expect(matches(["climate", "Boston"], { includes: "bos" })).toBe(true);
-    expect(matches("p_raj", { oneOf: ["p_raj", "p_leo"] })).toBe(true);
+    expect(matches("b2c3d4e5", { oneOf: ["b2c3d4e5", "d4e5f6a7"] })).toBe(true);
     expect(matches(undefined, { present: true })).toBe(false);
     expect(matches(undefined, { absent: true })).toBe(true);
     expect(matches(["a", "b"], { contains: "b" })).toBe(true);
@@ -64,7 +64,7 @@ describe("gradeFirstCall", () => {
     const g = gradeFirstCall(
       scenario,
       reply("log_interaction", {
-        person_id: "p_raj",
+        person_id: "b2c3d4e5",
         type: "call",
         summary: "Seed round",
         occurred_on: "2026-09-23",
@@ -78,12 +78,12 @@ describe("gradeFirstCall", () => {
     expect(gradeFirstCall(scenario, reply("whats_due", {})).reasons[0]).toMatch(/expected log_interaction/);
     const wrongDate = gradeFirstCall(
       scenario,
-      reply("log_interaction", { person_id: "p_raj", type: "call", summary: "x", occurred_on: "2026-09-24" }),
+      reply("log_interaction", { person_id: "b2c3d4e5", type: "call", summary: "x", occurred_on: "2026-09-24" }),
     );
     expect(wrongDate.pass).toBe(false);
     expect(wrongDate.reasons.join(" ")).toMatch(/occurred_on/);
     expect(gradeFirstCall(scenario, reply("log_interaction", "{not json")).jsonValid).toBe(false);
-    const badSchema = gradeFirstCall(scenario, reply("log_interaction", { person_id: "p_raj", type: "coffee" }));
+    const badSchema = gradeFirstCall(scenario, reply("log_interaction", { person_id: "b2c3d4e5", type: "coffee" }));
     expect(badSchema.schemaValid).toBe(false);
   });
 

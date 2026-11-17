@@ -8,6 +8,13 @@
       "when": 1789234297394,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1794882866231,
+      "tag": "0001_headless_agent",
+      "breakpoints": true
     }
   ]
 }

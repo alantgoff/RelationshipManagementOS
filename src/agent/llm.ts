@@ -20,9 +20,12 @@ export interface ToolCall {
   function: { name: string; arguments: string };
 }
 
+/** OpenAI-compatible multimodal content part (used for images). */
+export type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+
 export interface ChatMessage {
   role: Role;
-  content: string | null;
+  content: string | ContentPart[] | null;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -69,10 +72,14 @@ export class LlmError extends Error {
   }
 }
 
-export function providersFromEnv(env: NodeJS.ProcessEnv = process.env): ProviderConfig[] {
+/**
+ * Providers from environment. `group` "LLM" reads LLM_PRIMARY_* and
+ * LLM_FALLBACK_*; "VISION" reads VISION_PRIMARY_* / VISION_FALLBACK_*.
+ */
+export function providersFromEnv(env: NodeJS.ProcessEnv = process.env, group = "LLM"): ProviderConfig[] {
   const out: ProviderConfig[] = [];
   for (const name of ["primary", "fallback"] as const) {
-    const prefix = `LLM_${name.toUpperCase()}_`;
+    const prefix = `${group}_${name.toUpperCase()}_`;
     const baseUrl = env[`${prefix}BASE_URL`];
     const model = env[`${prefix}MODEL`];
     if (baseUrl && model) out.push({ name, baseUrl, model, apiKey: env[`${prefix}API_KEY`] ?? "" });

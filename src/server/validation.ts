@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DEAL_SOURCE_QUALITIES, INTERACTION_TYPES, LP_STAGES, ROLES } from "@/domain/enums";
+import { isValidTimeZone } from "@/lib/time";
 
 const optionalText = z
   .string()
@@ -60,7 +61,12 @@ export const reminderInput = z.object({
 export type ReminderInput = z.input<typeof reminderInput>;
 
 export const settingsInput = z.object({
-  timezone: z.string().trim().min(1).max(64),
+  timezone: z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .refine((tz) => isValidTimeZone(tz), "Unknown timezone; use an IANA name like America/New_York"),
   defaultCadences: z.partialRecord(z.enum(ROLES), z.coerce.number().int().min(1).max(3650)),
 });
 export type SettingsInput = z.input<typeof settingsInput>;

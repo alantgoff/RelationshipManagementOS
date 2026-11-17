@@ -5,3 +5,5 @@ process.env.DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres://rmos:rmo
 process.env.DEV_USER_ID = process.env.DEV_USER_ID ?? "test-user";
 delete process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 delete process.env.CLERK_SECRET_KEY;
+// Deterministic test key for message encryption (never used outside tests).
+process.env.RMOS_ENCRYPTION_KEY = process.env.RMOS_ENCRYPTION_KEY ?? Buffer.alloc(32, 7).toString("base64");

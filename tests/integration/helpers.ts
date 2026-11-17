@@ -3,7 +3,7 @@ import { closeDb, getDb } from "@/db/client";
 
 export async function resetDb(): Promise<void> {
   await getDb().execute(
-    sql`truncate table follow_ups, reminders, interactions, person_tags, tags, people, user_settings restart identity cascade`,
+    sql`truncate table notification_log, thread_summaries, memory_facts, pending_actions, agent_actions, agent_turns, channel_messages, channel_bindings, follow_ups, reminders, interactions, person_tags, tags, people, user_settings restart identity cascade`,
   );
 }
 

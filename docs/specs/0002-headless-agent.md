@@ -1,7 +1,7 @@
 # Spec 0002: Headless iMessage agent (v2, milestone M1)
 
 Date: 2026-09-26
-Status: Accepted
+Status: Accepted; M1 implemented (see §7)
 Depends on: spec 0001, ADR-0002, ADR-0003
 
 ## 1. Purpose
@@ -73,3 +73,19 @@ Schemas: `src/agent/tool-specs.ts`.
    owner verifies? Checked by `npm run check:sendblue` before Phase 1 work.
 2. Is base Qwen3.8-27B reliable enough at first-call tool use? Checked by
    `npm run eval` against Tinker before Phase 2 work.
+
+## 7. Implementation notes (M1)
+
+- Scheduling: `/api/cron/tick` is called every 15 minutes by
+  `.github/workflows/agent-cron.yml` (free; Vercel Hobby cron is daily only).
+  Briefs are sent once per local weekday inside a 150-minute window after
+  `brief_time`, guarded by a unique log row so overlapping ticks can't double-send.
+- Ids shown to the model are 8-character handles of the UUIDs; tools accept
+  either form and only resolve ids owned by the current owner.
+- Attachments are processed once on arrival and only the derived text is kept
+  (transcript, description, parsed contact card); provider URLs expire.
+- Drafts: the owner sends them; replying 👍 / "sent" right after the draft logs
+  the interaction; "skip" discards it. `undo` reverses the latest turn with changes.
+- Tests: `tests/integration/agent-*.test.ts` run the real runtime against
+  Postgres with a scripted model; `tests/e2e/agent.spec.ts` exercises the webhook,
+  cron auth and phone binding through HTTP.

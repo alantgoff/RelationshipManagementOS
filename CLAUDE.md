@@ -239,6 +239,8 @@ npm run db:migrate                # apply src/db/migrations
 npm run dev                       # http://localhost:3000 (dev user when Clerk keys absent)
 npm run check                     # typecheck + lint + vitest (needs Postgres at TEST_DATABASE_URL or rmos_test)
 npm run build && npm run test:e2e # Playwright acceptance suite against a production build
+npm run eval                      # first-call tool-use eval against the live model (LLM_* env)
+npm run check:sendblue            # confirm the iMessage line can text you first
 ```
 Schema changes: edit `src/db/schema.ts`, then `npm run db:generate` and commit the SQL.
 
@@ -257,6 +259,11 @@ Fund extras: LP prospect stage, deal-source quality, intro tracking.
 ### Layout
 - `/src` application code, `/tests` tests, `/docs` specs and ADRs, `/scripts` tooling
 - Specs live in `/docs/specs/`, architecture decisions in `/docs/adr/`
+- Headless agent (spec 0002): `src/agent/` (runtime, context, tools, commands, brief, store, media),
+  `src/channels/` (provider adapters), webhook `src/app/api/channels/sendblue`, cron `src/app/api/cron/tick`
+- Agent code acts as the owner only inside `runAsOwner()` (`src/server/auth.ts`); tools wrap the v1
+  server actions, so owner scoping stays in one place. Never add a tool that takes a user id.
+- Agent tests use a scripted model and a fake line: `tests/integration/agent-harness.ts`
 
 ### Workflow
 1. New feature: `/sparc:spec-pseudocode` first, then `/sparc:architect`, then implement.

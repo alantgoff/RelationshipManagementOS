@@ -1,7 +1,7 @@
-import { and, asc, desc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { getDb } from "@/db/client";
-import { followUps, interactions, people, personTags, reminders, tags, type FollowUp, type Interaction, type Person, type Reminder } from "@/db/schema";
+import { followUps, interactions, memoryFacts, people, personTags, reminders, tags, type FollowUp, type Interaction, type Person, type Reminder } from "@/db/schema";
 import type { Health } from "@/domain/enums";
 import { computeHealth } from "@/domain/health";
 import { requireUserId } from "@/server/auth";
@@ -19,6 +19,8 @@ export interface PersonDetail extends Person {
   health: Health;
   timeline: TimelineItem[];
   reminders: Reminder[];
+  /** What the agent has learned about this person (current facts only). */
+  facts: { id: string; fact: string; sourceKind: string; createdAt: Date }[];
   introsGiven: number;
   introsReceived: number;
 }
@@ -99,5 +101,10 @@ export async function getPerson(id: string, now = new Date()): Promise<PersonDet
     reminders: reminderRows,
     introsGiven: Number(counts?.given ?? 0),
     introsReceived: Number(counts?.received ?? 0),
+    facts: await db
+      .select({ id: memoryFacts.id, fact: memoryFacts.fact, sourceKind: memoryFacts.sourceKind, createdAt: memoryFacts.createdAt })
+      .from(memoryFacts)
+      .where(and(eq(memoryFacts.userId, userId), eq(memoryFacts.personId, id), isNull(memoryFacts.validTo)))
+      .orderBy(desc(memoryFacts.createdAt)),
   };
 }

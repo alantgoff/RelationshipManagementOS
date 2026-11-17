@@ -100,7 +100,15 @@ function LpBoard({ rows }: { rows: Row[] }) {
   const groups: Record<LpStage | "unset", Row[]> = { unset: [], identified: [], intro_made: [], first_meeting: [], data_room: [], soft_commit: [], committed: [], passed: [] };
   for (const p of lps) groups[p.lpStage ?? "unset"].push(p);
   const cols: (LpStage | "unset")[] = ["unset", ...LP_STAGES];
+  const usd = (n: number) => `$${n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(2)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}k` : n}`;
+  const sum = (stage: LpStage) => groups[stage].reduce((t, p) => t + (p.lpCommitmentUsd ?? 0), 0);
+  const active = lps.filter((p) => p.lpStage && p.lpStage !== "committed" && p.lpStage !== "passed").length;
   return (
+    <div className="grid gap-3">
+    <p className="text-sm text-muted" data-testid="lp-summary">
+      Committed <strong className="text-foreground">{usd(sum("committed"))}</strong> · Soft-circled{" "}
+      <strong className="text-foreground">{usd(sum("soft_commit"))}</strong> · {active} in conversation
+    </p>
     <div className="overflow-x-auto">
       <div className="grid min-w-[56rem] grid-cols-8 gap-2">
         {cols.map((s) => (
@@ -110,6 +118,7 @@ function LpBoard({ rows }: { rows: Row[] }) {
               {groups[s].map((p) => (
                 <li key={p.id} className="rounded border border-border p-2 text-sm">
                   <Link href={`/people/${p.id}`} className="font-medium hover:underline">{p.fullName}</Link>
+                  {p.lpCommitmentUsd != null && <div className="text-xs text-muted">{usd(p.lpCommitmentUsd)}</div>}
                   <div className="mt-1"><HealthBadge health={p.health} /></div>
                 </li>
               ))}
@@ -117,6 +126,7 @@ function LpBoard({ rows }: { rows: Row[] }) {
           </section>
         ))}
       </div>
+    </div>
     </div>
   );
 }

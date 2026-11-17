@@ -45,17 +45,18 @@ export default async function PersonPage({ params }: { params: Promise<{ id: str
             {isDealSource && <DealQualitySelect personId={p.id} value={p.dealSourceQuality} />}
           </div>
         )}
-        <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm sm:grid-cols-4">
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
           {p.email && <><dt className="text-muted">Email</dt><dd className="truncate"><a className="hover:underline" href={`mailto:${p.email}`}>{p.email}</a></dd></>}
           {p.phone && <><dt className="text-muted">Phone</dt><dd>{p.phone}</dd></>}
-          {p.howWeMet && <><dt className="text-muted">How we met</dt><dd className="col-span-1 sm:col-span-3">{p.howWeMet}</dd></>}
+          {p.howWeMet && <><dt className="text-muted">How we met</dt><dd>{p.howWeMet}</dd></>}
+          {p.lpCommitmentUsd != null && <><dt className="text-muted">Commitment</dt><dd>${p.lpCommitmentUsd.toLocaleString("en-US")}</dd></>}
           <dt className="text-muted">Intros</dt><dd data-testid="intros">{p.introsGiven} given · {p.introsReceived} received</dd>
         </dl>
         {p.notes && <p className="whitespace-pre-wrap text-sm border-t border-border pt-3">{p.notes}</p>}
       </header>
 
       <div className="grid gap-6 md:grid-cols-[2fr_1fr]">
-        <section aria-labelledby="timeline" className="grid gap-3">
+        <section aria-labelledby="timeline" className="grid content-start gap-3">
           <h2 id="timeline" className="text-sm font-semibold">Timeline</h2>
           {p.timeline.length === 0 && <p className="card text-sm text-muted">No interactions yet. Log the first one.</p>}
           <ol className="grid gap-3" data-testid="timeline">
@@ -84,7 +85,19 @@ export default async function PersonPage({ params }: { params: Promise<{ id: str
           </ol>
         </section>
 
-        <aside className="grid gap-6">
+        <aside className="grid content-start gap-6">
+          {p.facts.length > 0 && (
+            <section className="card" aria-labelledby="facts">
+              <h2 id="facts" className="text-sm font-semibold mb-2">What the agent knows</h2>
+              <ul className="grid gap-1 text-sm">
+                {p.facts.map((f) => (
+                  <li key={f.id}>
+                    {f.fact} <span className="text-xs text-muted">· {formatDate(f.createdAt)}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
           <section className="card" aria-labelledby="open-fu">
             <h2 id="open-fu" className="text-sm font-semibold mb-2">Open follow-ups ({openFollowUps.length})</h2>
             {openFollowUps.length === 0 ? <p className="text-sm text-muted">None.</p> : (

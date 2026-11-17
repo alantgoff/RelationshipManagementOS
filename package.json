@@ -16,7 +16,8 @@
     "test:e2e": "playwright test",
     "check": "npm run typecheck && npm run lint && npm test",
     "eval": "tsx scripts/eval.ts",
-    "check:sendblue": "tsx scripts/sendblue-check.ts"
+    "check:sendblue": "tsx scripts/sendblue-check.ts",
+    "seed:demo": "tsx scripts/seed-demo.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.9.2",

@@ -2,11 +2,13 @@ import type { StoredMedia } from "@/db/schema";
 import type { InboundMedia } from "@/channels/types";
 import { describeContact, parseVCards } from "@/channels/vcard";
 import { chat, providersFromEnv, type ChatResult, type ProviderConfig } from "./llm";
+import { escapeTagText } from "./text";
 
 /**
  * Turns inbound attachments into text the agent can read. Provider media URLs
- * expire and binaries are sensitive, so attachments are processed once and
- * only the derived text is stored (StoredMedia.derivedText).
+ * expire and binaries are sensitive, so attachments are processed once; the
+ * derived text becomes part of the message body (encrypted like any body) and
+ * the media column keeps only the kind, type and any error.
  *
  * Voice notes: an OpenAI-compatible /audio/transcriptions endpoint
  *   (TRANSCRIBE_BASE_URL, TRANSCRIBE_API_KEY, TRANSCRIBE_MODEL, e.g. Whisper
@@ -29,6 +31,17 @@ export interface MediaDeps {
 
 export const defaultMediaDeps = (): MediaDeps => ({ fetch, env: process.env });
 
+/** An attachment after processing. derivedText is never stored in the media column. */
+export interface ProcessedMedia extends StoredMedia {
+  derivedText?: string;
+}
+
+/** Default cap on all attachment work for one message, so a turn still fits the webhook budget. */
+export const MEDIA_BUDGET_MS = 20_000;
+
+/** A timeout signal that also fires when the message's overall media budget runs out. */
+const within = (ms: number, budget?: AbortSignal) => (budget ? AbortSignal.any([AbortSignal.timeout(ms), budget]) : AbortSignal.timeout(ms));
+
 export function mediaKind(m: InboundMedia): StoredMedia["kind"] {
   const type = (m.contentType ?? "").toLowerCase();
   const path = m.url.split("?")[0].toLowerCase();
@@ -38,8 +51,8 @@ export function mediaKind(m: InboundMedia): StoredMedia["kind"] {
   return "file";
 }
 
-async function download(m: InboundMedia, deps: MediaDeps): Promise<{ bytes: ArrayBuffer; type: string }> {
-  const res = await deps.fetch(m.url, { signal: AbortSignal.timeout(20_000) });
+async function download(m: InboundMedia, deps: MediaDeps, budget?: AbortSignal): Promise<{ bytes: ArrayBuffer; type: string }> {
+  const res = await deps.fetch(m.url, { signal: within(20_000, budget) });
   if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
   const length = Number(res.headers.get("content-length") ?? 0);
   if (length > MAX_BYTES) throw new Error("attachment too large");
@@ -48,10 +61,10 @@ async function download(m: InboundMedia, deps: MediaDeps): Promise<{ bytes: Arra
   return { bytes, type: m.contentType ?? res.headers.get("content-type") ?? "application/octet-stream" };
 }
 
-async function transcribe(m: InboundMedia, deps: MediaDeps): Promise<string> {
+async function transcribe(m: InboundMedia, deps: MediaDeps, budget?: AbortSignal): Promise<string> {
   const base = deps.env.TRANSCRIBE_BASE_URL;
   if (!base) throw new Error("voice notes are not configured (TRANSCRIBE_BASE_URL)");
-  const { bytes, type } = await download(m, deps);
+  const { bytes, type } = await download(m, deps, budget);
   const name = m.url.split("?")[0].split("/").pop() || "voice-note.caf";
   const form = new FormData();
   form.append("file", new Blob([bytes], { type }), name);
@@ -61,7 +74,7 @@ async function transcribe(m: InboundMedia, deps: MediaDeps): Promise<string> {
     method: "POST",
     headers: deps.env.TRANSCRIBE_API_KEY ? { authorization: `Bearer ${deps.env.TRANSCRIBE_API_KEY}` } : {},
     body: form,
-    signal: AbortSignal.timeout(60_000),
+    signal: within(60_000, budget),
   });
   if (!res.ok) throw new Error(`transcription failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   const json = (await res.json()) as { text?: string };
@@ -70,12 +83,13 @@ async function transcribe(m: InboundMedia, deps: MediaDeps): Promise<string> {
   return text;
 }
 
-async function describeImage(m: InboundMedia, deps: MediaDeps): Promise<string> {
+async function describeImage(m: InboundMedia, deps: MediaDeps, deadline: number, budget?: AbortSignal): Promise<string> {
   const providers = providersFromEnv(deps.env, "VISION");
   if (providers.length === 0) throw new Error("image understanding is not configured (VISION_PRIMARY_*)");
-  const { bytes, type } = await download(m, deps);
+  const { bytes, type } = await download(m, deps, budget);
   const dataUrl = `data:${type};base64,${Buffer.from(bytes).toString("base64")}`;
-  const run = deps.vision ?? ((messages, p) => chat({ messages, maxTokens: 600, temperature: 0.1 }, p));
+  const timeoutMs = Math.max(1_000, deadline - Date.now());
+  const run = deps.vision ?? ((messages, p) => chat({ messages, maxTokens: 600, temperature: 0.1, timeoutMs }, p));
   const res = await run(
     [
       {
@@ -96,8 +110,8 @@ async function describeImage(m: InboundMedia, deps: MediaDeps): Promise<string> 
   return text;
 }
 
-async function readContact(m: InboundMedia, deps: MediaDeps): Promise<string> {
-  const { bytes } = await download(m, deps);
+async function readContact(m: InboundMedia, deps: MediaDeps, budget?: AbortSignal): Promise<string> {
+  const { bytes } = await download(m, deps, budget);
   const cards = parseVCards(new TextDecoder().decode(bytes));
   if (cards.length === 0) throw new Error("no contacts found in the card");
   return cards.map(describeContact).join("\n");
@@ -110,30 +124,54 @@ const LABEL: Record<StoredMedia["kind"], string> = {
   file: "Attachment",
 };
 
-/** Process each attachment; never throws. */
-export async function processMedia(media: InboundMedia[], deps: MediaDeps = defaultMediaDeps()): Promise<StoredMedia[]> {
+/** Process each attachment within `budgetMs` in total; never throws. */
+export async function processMedia(
+  media: InboundMedia[],
+  deps: MediaDeps = defaultMediaDeps(),
+  budgetMs = MEDIA_BUDGET_MS,
+): Promise<ProcessedMedia[]> {
+  const deadline = Date.now() + Math.max(0, budgetMs);
+  const budget = AbortSignal.timeout(Math.max(1, budgetMs));
   return Promise.all(
-    media.map(async (m): Promise<StoredMedia> => {
+    media.map(async (m): Promise<ProcessedMedia> => {
       const kind = mediaKind(m);
       try {
-        if (kind === "audio") return { kind, contentType: m.contentType, derivedText: await transcribe(m, deps) };
-        if (kind === "image") return { kind, contentType: m.contentType, derivedText: await describeImage(m, deps) };
-        if (kind === "contact") return { kind, contentType: m.contentType, derivedText: await readContact(m, deps) };
+        if (budgetMs <= 0) throw new Error("no time left to read it");
+        if (kind === "audio") return { kind, contentType: m.contentType, derivedText: await transcribe(m, deps, budget) };
+        if (kind === "image") return { kind, contentType: m.contentType, derivedText: await describeImage(m, deps, deadline, budget) };
+        if (kind === "contact") return { kind, contentType: m.contentType, derivedText: await readContact(m, deps, budget) };
         return { kind, contentType: m.contentType, error: "unsupported attachment type" };
       } catch (err) {
-        return { kind, contentType: m.contentType, error: err instanceof Error ? err.message : String(err) };
+        const timedOut = budget.aborted || (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError"));
+        return { kind, contentType: m.contentType, error: timedOut ? "took too long to read" : err instanceof Error ? err.message : String(err) };
       }
     }),
   );
 }
 
-/** Text appended to the owner's message so the model sees attachments. */
-export function mediaToText(media: StoredMedia[]): string {
+/** What gets stored in the media column: no derived text (it lives in the encrypted body). */
+export function storableMedia(media: ProcessedMedia[]): StoredMedia[] {
+  return media.map(({ kind, contentType, error }) => ({ kind, ...(contentType ? { contentType } : {}), ...(error ? { error: error.slice(0, 300) } : {}) }));
+}
+
+/**
+ * Attachment text for the model. A voice note is the owner's own words, so its
+ * transcript reads as their message. Image descriptions and contact cards come
+ * from someone else's content: they are wrapped in <attachment> with tags
+ * escaped, and the system prompt says to treat them as data, not instructions.
+ */
+export function mediaToText(media: ProcessedMedia[]): string {
   return media
-    .map((m) =>
-      m.derivedText
-        ? `[${LABEL[m.kind]}] ${m.derivedText}`
-        : `[${LABEL[m.kind]} could not be read: ${m.error ?? "unknown error"}]`,
-    )
+    .map((m) => {
+      if (!m.derivedText) return `[${LABEL[m.kind]} could not be read: ${m.error ?? "unknown error"}]`;
+      if (m.kind === "audio") return `[${LABEL.audio}] ${m.derivedText}`;
+      const type = m.kind === "contact" ? "contact card" : m.kind === "image" ? "image" : "file";
+      return `<attachment type="${type}">\n${escapeTagText(m.derivedText)}\n</attachment>`;
+    })
     .join("\n");
+}
+
+/** The full text of an inbound message: what the owner typed, then each attachment. */
+export function composeInboundText(text: string, media: ProcessedMedia[], maxChars = 12_000): string {
+  return [text.trim(), media.length ? mediaToText(media) : ""].filter(Boolean).join("\n").slice(0, maxChars);
 }

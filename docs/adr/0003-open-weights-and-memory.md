@@ -37,7 +37,8 @@ owner's control. There is no always-on Mac available.
 Stable first, volatile last, so providers can reuse the cached prefix:
 system prompt and sorted tool list → learned playbook → owner profile →
 rolling thread summary → working set (people in play, due items, pending
-drafts, calendar window) → last ~12 turns with old tool results cleared →
+drafts, calendar window) → the 12–24 messages after the summary's cursor,
+with old tool results cleared (older ones are folded into the summary) →
 the new message. Target under 20k tokens. Anything else is fetched by tools.
 
 ### Memory

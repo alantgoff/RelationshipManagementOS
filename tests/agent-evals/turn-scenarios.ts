@@ -177,7 +177,7 @@ export const EVAL_PHONE = "+14155550177";
 /** Wipe the scratch database. Only ever run against a dedicated eval/test database. */
 export async function resetEvalDb(): Promise<void> {
   await db().execute(
-    sql`truncate table notification_log, thread_summaries, memory_facts, pending_actions, agent_actions, agent_turns, channel_messages, channel_bindings, follow_ups, reminders, interactions, person_tags, tags, people, user_settings restart identity cascade`,
+    sql`truncate table binding_failures, notification_log, thread_summaries, memory_facts, pending_actions, agent_actions, agent_turns, channel_messages, channel_bindings, follow_ups, reminders, interactions, person_tags, tags, people, user_settings restart identity cascade`,
   );
 }
 

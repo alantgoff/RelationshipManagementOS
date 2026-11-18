@@ -76,12 +76,14 @@ export function parseVCards(text: string): VCardContact[] {
 
 /** One-line description for the agent's context. */
 export function describeContact(c: VCardContact): string {
+  // One line per card: fields can't smuggle in extra lines that read like new instructions.
+  const flat = (s: string | undefined) => s?.replace(/\s+/g, " ").trim() || undefined;
   return [
-    c.fullName || "(no name)",
-    c.title && c.company ? `${c.title} at ${c.company}` : c.title || c.company,
-    c.emails.length ? `email ${c.emails.join(", ")}` : undefined,
-    c.phones.length ? `phone ${c.phones.join(", ")}` : undefined,
-    c.note ? `note: ${c.note}` : undefined,
+    flat(c.fullName) || "(no name)",
+    flat(c.title && c.company ? `${c.title} at ${c.company}` : c.title || c.company),
+    c.emails.length ? `email ${flat(c.emails.join(", "))}` : undefined,
+    c.phones.length ? `phone ${flat(c.phones.join(", "))}` : undefined,
+    c.note ? `note: ${flat(c.note.slice(0, 300))}` : undefined,
   ]
     .filter(Boolean)
     .join("; ");

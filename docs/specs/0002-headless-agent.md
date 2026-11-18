@@ -82,10 +82,19 @@ Schemas: `src/agent/tool-specs.ts`.
   `brief_time`, guarded by a unique log row so overlapping ticks can't double-send.
 - Ids shown to the model are 8-character handles of the UUIDs; tools accept
   either form and only resolve ids owned by the current owner.
-- Attachments are processed once on arrival and only the derived text is kept
-  (transcript, description, parsed contact card); provider URLs expire.
-- Drafts: the owner sends them; replying 👍 / "sent" right after the draft logs
-  the interaction; "skip" discards it. `undo` reverses the latest turn with changes.
+- Attachments are processed once on arrival (capped at 20s); the derived text
+  (transcript, description, parsed contact card) is stored encrypted in the
+  message body, and image or card text reaches the model inside `<attachment>`
+  tags as data, never instructions. Provider URLs expire.
+- One owner's messages are handled one at a time under a Postgres advisory
+  lock; a burst of texts becomes one turn. Work after the webhook has a 50s
+  budget (route `maxDuration` 60). A message a killed run left behind is picked
+  up by the next tick, which reports what was already saved instead of redoing it.
+- Drafts: the owner sends them; 👍 / "sent" logs the one just shown (or the only
+  one waiting), a tapback logs the draft it quotes, "skip" discards; "yes" or
+  "looks good" go to the model, which can call `resolve_draft`. Drafts expire
+  after 7 days. `undo` reverses the latest turn with changes (within 24h),
+  restoring only fields nobody has changed since.
 - Tests: `tests/integration/agent-*.test.ts` run the real runtime against
   Postgres with a scripted model; `tests/e2e/agent.spec.ts` exercises the webhook,
   cron auth and phone binding through HTTP.

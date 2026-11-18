@@ -38,7 +38,8 @@ describe("ids", () => {
     const { id } = await createPerson({ fullName: "Priya Patel" });
     expect((await call("get_person", { person_id: shortId(id) })).ok).toBe(true);
     expect((await call("get_person", { person_id: id })).ok).toBe(true);
-    expect((await call("get_person", { person_id: `[${shortId(id)}]` })).ok).toBe(false);
+    // Copying the handle with its brackets still works.
+    expect((await call("get_person", { person_id: `[${shortId(id)}]` })).ok).toBe(true);
     actAs("someone-else");
     const other = await createPerson({ fullName: "Not Yours" });
     actAs(OWNER);
@@ -91,7 +92,7 @@ describe("log_interaction", () => {
   it("rejects future dates and past follow-up due dates with guidance", async () => {
     const { id } = await createPerson({ fullName: "Raj Mehta" });
     const future = await call("log_interaction", { person_id: shortId(id), type: "call", summary: "x", occurred_on: "2026-09-30" });
-    expect(future.text).toMatch(/in the future.*set_reminder/);
+    expect(future.text).toMatch(/after today \(2026-09-24\).*most recent such day.*set_reminder/);
     const pastDue = await call("log_interaction", {
       person_id: shortId(id),
       type: "call",

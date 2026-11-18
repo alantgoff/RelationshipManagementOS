@@ -41,7 +41,9 @@ export interface ChatRequest {
   tools?: ToolSpec[];
   temperature?: number;
   maxTokens?: number;
-  /** Abort the whole call (including failover) after this many ms. */
+  /** "none" makes the model answer in text even though tools are declared. */
+  toolChoice?: "auto" | "none";
+  /** Overall budget for the call, including retries and failover. */
   timeoutMs?: number;
 }
 
@@ -59,6 +61,8 @@ export interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  /** Provider-specific request fields, e.g. {"chat_template_kwargs":{"enable_thinking":false}}. */
+  extraBody?: Record<string, unknown>;
 }
 
 export class LlmError extends Error {
@@ -75,6 +79,8 @@ export class LlmError extends Error {
 /**
  * Providers from environment. `group` "LLM" reads LLM_PRIMARY_* and
  * LLM_FALLBACK_*; "VISION" reads VISION_PRIMARY_* / VISION_FALLBACK_*.
+ * Each may set *_EXTRA_BODY to a JSON object merged into every request
+ * (for example to turn off a hybrid model's thinking mode).
  */
 export function providersFromEnv(env: NodeJS.ProcessEnv = process.env, group = "LLM"): ProviderConfig[] {
   const out: ProviderConfig[] = [];
@@ -82,16 +88,35 @@ export function providersFromEnv(env: NodeJS.ProcessEnv = process.env, group = "
     const prefix = `${group}_${name.toUpperCase()}_`;
     const baseUrl = env[`${prefix}BASE_URL`];
     const model = env[`${prefix}MODEL`];
-    if (baseUrl && model) out.push({ name, baseUrl, model, apiKey: env[`${prefix}API_KEY`] ?? "" });
+    if (!baseUrl || !model) continue;
+    let extraBody: Record<string, unknown> | undefined;
+    const rawExtra = env[`${prefix}EXTRA_BODY`];
+    if (rawExtra) {
+      try {
+        const parsed: unknown = JSON.parse(rawExtra);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) extraBody = parsed as Record<string, unknown>;
+      } catch {
+        console.warn(`[llm] ignoring ${prefix}EXTRA_BODY: not valid JSON`);
+      }
+    }
+    out.push({ name, baseUrl, model, apiKey: env[`${prefix}API_KEY`] ?? "", ...(extraBody ? { extraBody } : {}) });
   }
   return out;
 }
 
 const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504]);
+/** Longest a single primary attempt may take when a fallback is configured. */
+export const PRIMARY_ATTEMPT_CAP_MS = 30_000;
 
-async function callProvider(p: ProviderConfig, req: ChatRequest, signal: AbortSignal): Promise<ChatResult> {
+async function callProvider(p: ProviderConfig, req: ChatRequest, timeoutMs: number): Promise<ChatResult> {
   const started = Date.now();
+  const signal = AbortSignal.timeout(Math.max(1, timeoutMs));
   let res: Response;
+  let json: {
+    model?: string;
+    choices?: { message?: ChatMessage; finish_reason?: string | null }[];
+    usage?: ChatResult["usage"];
+  };
   try {
     res = await fetch(`${p.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
@@ -102,24 +127,23 @@ async function callProvider(p: ProviderConfig, req: ChatRequest, signal: AbortSi
       body: JSON.stringify({
         model: p.model,
         messages: req.messages,
-        ...(req.tools?.length ? { tools: req.tools, tool_choice: "auto" } : {}),
+        ...(req.tools?.length ? { tools: req.tools, tool_choice: req.toolChoice ?? "auto" } : {}),
         temperature: req.temperature ?? 0.3,
         max_tokens: req.maxTokens ?? 2048,
+        ...p.extraBody,
       }),
       signal,
     });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new LlmError(`${p.name}: HTTP ${res.status} ${body.slice(0, 300)}`, res.status, RETRYABLE.has(res.status));
+    }
+    json = await res.json();
   } catch (err) {
-    throw new LlmError(`${p.name}: ${err instanceof Error ? err.message : "network error"}`, null, true);
+    if (err instanceof LlmError) throw err;
+    const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+    throw new LlmError(`${p.name}: ${timedOut ? `timed out after ${timeoutMs}ms` : err instanceof Error ? err.message : "network error"}`, null, !timedOut);
   }
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new LlmError(`${p.name}: HTTP ${res.status} ${body.slice(0, 300)}`, res.status, RETRYABLE.has(res.status));
-  }
-  const json = (await res.json()) as {
-    model?: string;
-    choices?: { message?: ChatMessage; finish_reason?: string | null }[];
-    usage?: ChatResult["usage"];
-  };
   const choice = json.choices?.[0];
   if (!choice?.message) throw new LlmError(`${p.name}: response had no choices`, res.status, true);
   return {
@@ -132,25 +156,40 @@ async function callProvider(p: ProviderConfig, req: ChatRequest, signal: AbortSi
   };
 }
 
-/** One chat turn with retry and failover across the configured providers. */
+/**
+ * One chat turn with retry and failover (HA-9). Each attempt has its own
+ * deadline inside the overall budget. When a fallback is configured, a
+ * primary attempt may use at most 60% of the remaining time (capped at
+ * PRIMARY_ATTEMPT_CAP_MS), so a hung or erroring primary still leaves time
+ * for the fallback. Any primary failure moves on to the fallback; only fast,
+ * transient errors are retried on the same provider.
+ */
 export async function chat(req: ChatRequest, providers: ProviderConfig[] = providersFromEnv()): Promise<ChatResult> {
   if (providers.length === 0) {
     throw new LlmError("No LLM provider configured (set LLM_PRIMARY_BASE_URL and LLM_PRIMARY_MODEL)", null, false);
   }
-  const signal = AbortSignal.timeout(req.timeoutMs ?? 60_000);
-  let last: LlmError | undefined;
-  for (const p of providers) {
-    const attempts = p.name === "primary" ? 2 : 1;
-    for (let i = 0; i < attempts; i++) {
+  const deadline = Date.now() + (req.timeoutMs ?? 60_000);
+  const errors: LlmError[] = [];
+  for (let pi = 0; pi < providers.length; pi++) {
+    const p = providers[pi];
+    const hasNext = pi < providers.length - 1;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 50) break;
+      const budget = hasNext ? Math.min(PRIMARY_ATTEMPT_CAP_MS, Math.floor(remaining * 0.6)) : remaining;
       try {
-        return await callProvider(p, req, signal);
+        return await callProvider(p, req, budget);
       } catch (err) {
-        last = err instanceof LlmError ? err : new LlmError(String(err), null, true);
-        if (!last.retryable || signal.aborted) throw last;
+        const e = err instanceof LlmError ? err : new LlmError(String(err), null, true);
+        errors.push(e);
+        // Retry the same provider only for fast transient failures; anything else goes to the next provider.
+        if (!e.retryable || deadline - Date.now() < 2_000) break;
       }
     }
+    if (deadline - Date.now() <= 50) break;
   }
-  throw last ?? new LlmError("All providers failed", null, true);
+  const last = errors.at(-1) ?? new LlmError("LLM call ran out of time before any provider answered", null, true);
+  throw new LlmError(errors.length > 1 ? errors.map((e) => e.message).join(" | ") : last.message, last.status, last.retryable);
 }
 
 /** Parse a tool call's JSON arguments; returns null when the model emitted invalid JSON. */

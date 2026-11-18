@@ -1,35 +1,32 @@
-import { and, desc, eq } from "drizzle-orm";
+import { inArray } from "drizzle-orm";
 import { getDb } from "@/db/client";
-import { agentActions, agentTurns, pendingActions, people, threadSummaries } from "@/db/schema";
+import { agentActions, agentTurns } from "@/db/schema";
 import type { ChannelAdapter, InboundMessage } from "@/channels/types";
-import { decrypt, encrypt } from "@/lib/crypto";
-import { localDate } from "@/lib/time";
-import { logInteraction } from "@/server/actions/interactions";
 import { runAsOwner } from "@/server/auth";
-import { briefIsEmpty, briefScheduleCheck, composeBrief, gatherBriefData, type BriefSkipReason } from "./brief";
+import { briefIsEmpty, composeBrief, gatherBriefData, renderBriefFallback } from "./brief";
 import { HELP_TEXT, parseCommand, type Command } from "./commands";
-import { assembleContext, RECENT_MESSAGE_LIMIT, threadSummary } from "./context";
-import { chat, type ChatMessage, type ChatRequest, type ChatResult } from "./llm";
-import { defaultMediaDeps, mediaToText, processMedia, type MediaDeps } from "./media";
+import { approveDraft, rejectDraft, type ResolvedDraft } from "./drafts";
+import { chat, type ChatRequest, type ChatResult } from "./llm";
+import { composeInboundText, defaultMediaDeps, MEDIA_BUDGET_MS, processMedia, storableMedia, type MediaDeps } from "./media";
 import {
-  attachNotificationMessage,
-  claimBriefSlot,
   findOwnerByPhone,
   getAgentPrefs,
   insertInbound,
-  insertOutbound,
-  listVerifiedBindings,
+  lastOutboundKind,
   markProcessed,
-  messagesBetween,
-  recentMessages,
+  markReady,
+  pendingDrafts,
+  readyUnprocessed,
   redeemBindingCode,
-  releaseNotification,
-  unpromptedCountToday,
   updateAgentPrefs,
+  withOwnerLock,
+  type StoredMessage,
 } from "./store";
-import { toolSpecs } from "./tool-specs";
-import { executeToolCall, type ToolContext } from "./tools";
+import { maybeUpdateThreadSummary, runTurn, SEND_RESERVE_MS, sendOut } from "./turn";
 import { explainLastTurn, undoLastTurn } from "./undo";
+
+export { cleanReply, splitMessage } from "./text";
+export { maybeUpdateThreadSummary, runTurn, type TurnInput, type TurnResult } from "./turn";
 
 /* ───────────── Dependencies ───────────── */
 
@@ -52,46 +49,13 @@ export function defaultAgentDeps(adapter: ChannelAdapter): AgentDeps {
   };
 }
 
-/** Message kinds that form the conversation the model sees. */
-const CONVERSATION_KINDS = ["chat", "brief", "draft"];
-const MAX_STEPS = 6;
-const MAX_INBOUND_CHARS = 12_000;
-
-/* ───────────── Output helpers ───────────── */
-
-/** Strip reasoning tags and markdown that doesn't render in iMessage. */
-export function cleanReply(text: string): string {
-  return text
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/\*\*(.+?)\*\*/g, "$1")
-    .replace(/__(.+?)__/g, "$1")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-/** Split long text into at most `maxParts` messages at paragraph or sentence boundaries. */
-export function splitMessage(text: string, maxChars = 1200, maxParts = 3): string[] {
-  if (text.length <= maxChars) return [text];
-  const parts: string[] = [];
-  let rest = text;
-  while (rest.length > maxChars && parts.length < maxParts - 1) {
-    const window = rest.slice(0, maxChars);
-    const cut = Math.max(window.lastIndexOf("\n\n"), window.lastIndexOf("\n"), window.lastIndexOf(". ") + 1);
-    const at = cut > maxChars / 3 ? cut : maxChars;
-    parts.push(rest.slice(0, at).trim());
-    rest = rest.slice(at).trim();
-  }
-  parts.push(rest.length > maxChars ? `${rest.slice(0, maxChars - 1)}…` : rest);
-  return parts.filter(Boolean);
-}
-
-async function send(deps: AgentDeps, userId: string, to: string, body: string, kind: string): Promise<void> {
-  for (const part of splitMessage(body)) {
-    const res = await deps.adapter.sendText(to, part);
-    await insertOutbound({ userId, provider: deps.adapter.name, providerMessageId: res.providerMessageId, body: part, kind });
-  }
-}
+/**
+ * Real-clock budget for the work after a webhook responds. The webhook route's
+ * maxDuration (60s) must stay above this, or the platform kills a turn midway.
+ */
+export const WORK_BUDGET_MS = 50_000;
+/** Least time left for starting a model turn; less, and the message waits for the next run or tick. */
+export const MIN_TURN_MS = 20_000;
 
 /* ───────────── Intake ───────────── */
 
@@ -103,8 +67,8 @@ export type ReceiveResult =
 
 /**
  * The fast, synchronous part of a webhook (HA-1..HA-4): allowlist, binding
- * codes, and an idempotent insert. Unknown senders cause no writes and no
- * reply (HAC-4). Returns `work` to run after the HTTP response.
+ * codes, and an idempotent insert. Unknown senders cause no reply (HAC-4).
+ * Returns `work` to run after the HTTP response.
  */
 export async function receiveInbound(deps: AgentDeps, msg: InboundMessage): Promise<ReceiveResult> {
   if (deps.lineNumber && msg.to && msg.to !== deps.lineNumber) return { status: "ignored", reason: "wrong_line" };
@@ -114,18 +78,18 @@ export async function receiveInbound(deps: AgentDeps, msg: InboundMessage): Prom
     const code = msg.text.trim();
     const userId = /^\d{6}$/.test(code) ? await redeemBindingCode(code, msg.from, deps.now()) : null;
     if (!userId) return { status: "ignored", reason: "unknown_sender" };
-    await insertInbound({ userId, provider: deps.adapter.name, providerMessageId: msg.providerMessageId, body: msg.text, kind: "command" });
+    await insertInbound({ userId, provider: deps.adapter.name, providerMessageId: msg.providerMessageId, body: msg.text, kind: "command", processed: true });
     return {
       status: "bound",
       userId,
       work: () =>
-        send(
+        sendOut(
           deps,
           userId,
           msg.from,
           "You're connected. Text me what happened with people (\"coffee with Priya, send her the deck Friday\") or ask \"who's going cold?\". Text \"help\" for commands.",
           "command",
-        ),
+        ).then(() => undefined),
     };
   }
 
@@ -134,6 +98,7 @@ export async function receiveInbound(deps: AgentDeps, msg: InboundMessage): Prom
     provider: deps.adapter.name,
     providerMessageId: msg.providerMessageId,
     body: msg.text,
+    ready: msg.media.length === 0,
   });
   if (!messageId) return { status: "duplicate", userId: owner.userId };
   return {
@@ -146,75 +111,136 @@ export async function receiveInbound(deps: AgentDeps, msg: InboundMessage): Prom
 
 /* ───────────── Processing ───────────── */
 
-async function latestPendingDraft(userId: string) {
-  const [row] = await getDb()
-    .select({
-      id: pendingActions.id,
-      personId: pendingActions.personId,
-      channel: pendingActions.channel,
-      bodyEnc: pendingActions.bodyEnc,
-      name: people.fullName,
-    })
-    .from(pendingActions)
-    .innerJoin(people, eq(people.id, pendingActions.personId))
-    .where(and(eq(pendingActions.userId, userId), eq(pendingActions.status, "pending")))
-    .orderBy(desc(pendingActions.createdAt))
-    .limit(1);
-  return row ?? null;
+/**
+ * The slow part, after the webhook has responded: read attachments, then work
+ * through the owner's ready messages under a per-owner lock, so a burst of
+ * texts is answered in order, in as few turns as possible, never in parallel.
+ */
+export async function processInbound(deps: AgentDeps, userId: string, messageId: string, msg: InboundMessage): Promise<void> {
+  const deadline = Date.now() + WORK_BUDGET_MS;
+  await runAsOwner(userId, "channel", async () => {
+    if (msg.media.length) {
+      const budget = Math.min(MEDIA_BUDGET_MS, deadline - Date.now() - MIN_TURN_MS);
+      const media = await processMedia(msg.media, deps.media, budget);
+      await markReady(messageId, composeInboundText(msg.text, media), storableMedia(media));
+    }
+    await drainQueue(deps, userId, msg.from, deadline);
+  });
 }
 
-/** The slow part: runs after the webhook has responded, as the owner. */
-export async function processInbound(deps: AgentDeps, userId: string, messageId: string, msg: InboundMessage): Promise<void> {
-  await runAsOwner(userId, "channel", async () => {
-    const now = deps.now();
-    try {
-      const media = msg.media.length ? await processMedia(msg.media, deps.media) : [];
-      const attachmentText = media.length ? mediaToText(media) : "";
-      const text = [msg.text.trim(), attachmentText].filter(Boolean).join("\n").slice(0, MAX_INBOUND_CHARS);
-
-      const draft = await latestPendingDraft(userId);
-      const prior = (await recentMessages(userId, 2)).filter((m) => m.id !== messageId).at(-1);
-      const draftAwaitingReply = Boolean(draft) && prior?.direction === "out" && prior.kind === "draft";
-      const command = media.length ? null : parseCommand(msg.text, { draftAwaitingReply });
-
-      if (command) {
-        await markProcessed(messageId, { kind: "command", media });
-        const reply = await runCommand(deps, userId, command, now, draft);
-        await send(deps, userId, msg.from, reply.text, reply.kind);
-        return;
-      }
-      await markProcessed(messageId, { media });
-      if (!text) return;
-      await runTurn(deps, { userId, messageId, text, now, to: msg.from });
-    } catch (err) {
-      console.error("[agent] processing failed", err);
-      await markProcessed(messageId, { error: err instanceof Error ? err.message.slice(0, 500) : "error" });
-      await send(deps, userId, msg.from, "Sorry, something broke on my side. Your message is saved; try again in a minute.", "system").catch(
-        () => {},
-      );
+/**
+ * Answer ready messages until none are left or the budget runs low. Whoever
+ * holds the owner's lock also picks up messages that arrive meanwhile; a run
+ * that can't get the lock in time leaves its message for the holder or the tick.
+ * Must be called inside runAsOwner.
+ */
+export async function drainQueue(deps: AgentDeps, userId: string, to: string, deadline: number): Promise<void> {
+  await withOwnerLock(userId, deadline - Date.now() - MIN_TURN_MS, async () => {
+    const attempted = new Set<string>();
+    for (;;) {
+      const ready = await readyUnprocessed(userId);
+      if (ready.length === 0 || attempted.has(ready[0].id)) return;
+      const more = await processNext(deps, userId, to, ready, deadline, attempted);
+      if (!more) return;
     }
   });
 }
 
+async function commandFor(userId: string, m: StoredMessage): Promise<Command | null> {
+  if (m.media.length) return null; // attachments always go to the model
+  const [drafts, lastOut] = await Promise.all([pendingDrafts(userId), lastOutboundKind(userId, m.createdAt)]);
+  return parseCommand(m.body, { drafts: drafts.map((d) => ({ id: d.id, body: d.body })), lastOutboundWasDraft: lastOut === "draft" });
+}
+
+/** Handle the next unit of work: one command, or one run of consecutive chat messages. Returns false to stop. */
+async function processNext(deps: AgentDeps, userId: string, to: string, ready: StoredMessage[], deadline: number, attempted: Set<string>): Promise<boolean> {
+  const first = ready[0];
+  const command = await commandFor(userId, first);
+  if (command) {
+    attempted.add(first.id);
+    // Commands run at most once: mark first, so a crash can't replay an undo.
+    await markProcessed([first.id], { kind: command.kind === "reaction" ? "reaction" : "command" });
+    try {
+      const reply = await runCommand(deps, userId, first, command, deadline);
+      if (reply) await sendOut(deps, userId, to, reply.text, reply.kind, deadline);
+    } catch (err) {
+      console.error("[agent] command failed", err);
+      await sendOut(deps, userId, to, "Sorry, something broke on my side while doing that. Text \"why\" to see what I last changed.", "system", deadline).catch(() => {});
+    }
+    return true;
+  }
+
+  const run = [first];
+  for (const m of ready.slice(1)) {
+    if (await commandFor(userId, m)) break;
+    run.push(m);
+  }
+  const ids = run.map((m) => m.id);
+  ids.forEach((id) => attempted.add(id));
+
+  // A turn already started for these messages means a previous run was killed midway.
+  const prior = await getDb().select({ id: agentTurns.id, inbound: agentTurns.inboundMessageId }).from(agentTurns).where(inArray(agentTurns.inboundMessageId, ids));
+  if (prior.length) {
+    const cut = Math.max(...prior.map((t) => ids.indexOf(t.inbound!)));
+    await reportInterrupted(deps, userId, to, ids.slice(0, cut + 1), prior.map((t) => t.id), deadline);
+    return true;
+  }
+
+  if (Date.now() + MIN_TURN_MS > deadline) return false;
+  try {
+    const result = await runTurn(deps, { userId, messages: run, now: deps.now(), to, deadline });
+    await markProcessed(ids, result.sent ? {} : { error: "reply not delivered" });
+  } catch (err) {
+    console.error("[agent] turn failed", err);
+    await markProcessed(ids, { error: err instanceof Error ? err.message.slice(0, 500) : "error" });
+    await sendOut(deps, userId, to, "Sorry, something broke on my side and I may not have finished. Text \"why\" to see what I saved.", "system", deadline).catch(() => {});
+    return true;
+  }
+  // Keep the summary caught up while there's time to spare.
+  if (deadline - Date.now() > MIN_TURN_MS) {
+    await maybeUpdateThreadSummary(deps, userId, deps.now(), Math.min(15_000, deadline - Date.now() - SEND_RESERVE_MS)).catch((err) =>
+      console.error("[agent] summary update failed", err),
+    );
+  }
+  return true;
+}
+
+/** Tell the owner a turn was cut off, with what it had saved, instead of redoing (and duplicating) it. */
+async function reportInterrupted(deps: AgentDeps, userId: string, to: string, ids: string[], turnIds: string[], deadline: number): Promise<void> {
+  await markProcessed(ids, { error: "interrupted" });
+  const actions = await getDb().select({ summary: agentActions.summary, ok: agentActions.ok, undo: agentActions.undo }).from(agentActions).where(inArray(agentActions.turnId, turnIds));
+  const saved = actions.filter((a) => a.ok && a.undo).map((a) => a.summary);
+  const text = saved.length
+    ? `Sorry, I got cut off while handling your last message. Before that I saved: ${saved.join("; ")}. Tell me if anything's missing.`
+    : "Sorry, I got cut off while handling your last message and nothing was saved. Could you send it again?";
+  await sendOut(deps, userId, to, text, "system", deadline);
+}
+
 /* ───────────── Commands ───────────── */
 
-async function runCommand(
-  deps: AgentDeps,
-  userId: string,
-  command: Command,
-  now: Date,
-  draft: Awaited<ReturnType<typeof latestPendingDraft>>,
-): Promise<{ text: string; kind: string }> {
-  const prefs = await getAgentPrefs(userId);
+/** Record a draft resolved by command as its own turn, so `undo` and `why` cover it. */
+async function recordDraftAction(userId: string, messageId: string, tool: string, draftId: string, done: ResolvedDraft): Promise<void> {
+  const [turn] = await getDb().insert(agentTurns).values({ userId, inboundMessageId: messageId, steps: 0 }).returning({ id: agentTurns.id });
+  await getDb()
+    .insert(agentActions)
+    .values({ userId, turnId: turn.id, tool, input: { draft_id: draftId }, ok: true, summary: done.summary, undo: done.undo as unknown as Record<string, unknown> });
+}
+
+async function runCommand(deps: AgentDeps, userId: string, m: StoredMessage, command: Command, deadline: number): Promise<{ text: string; kind: string } | null> {
+  const now = deps.now();
   switch (command.kind) {
+    case "reaction":
+      return null;
     case "help":
       return { text: HELP_TEXT, kind: "command" };
     case "stop":
       await updateAgentPrefs(userId, { proactiveEnabled: false });
       return { text: "Okay, I won't message you first until you text \"start\". You can still text me anytime.", kind: "command" };
-    case "start":
+    case "start": {
+      const prefs = await getAgentPrefs(userId);
       await updateAgentPrefs(userId, { proactiveEnabled: true, pausedUntil: null });
       return { text: `Back on. Your brief comes weekdays at ${prefs.briefTime}.`, kind: "command" };
+    }
     case "pause": {
       const until = new Date(now.getTime() + command.minutes * 60_000);
       await updateAgentPrefs(userId, { pausedUntil: until });
@@ -226,223 +252,30 @@ async function runCommand(
     case "why":
       return { text: await explainLastTurn(userId), kind: "command" };
     case "brief": {
+      const prefs = await getAgentPrefs(userId);
       const data = await gatherBriefData(userId, now, prefs.timezone);
       if (briefIsEmpty(data)) return { text: "Nothing due and nobody going cold. Enjoy the quiet.", kind: "brief" };
-      return { text: (await composeBrief(deps.llm, data)).text, kind: "brief" };
+      const timeoutMs = Math.min(30_000, deadline - Date.now() - SEND_RESERVE_MS);
+      const text = timeoutMs < 3_000 ? renderBriefFallback(data) : (await composeBrief(deps.llm, data, timeoutMs)).text;
+      return { text, kind: "brief" };
     }
     case "approve": {
-      if (!draft) return { text: "There's no draft waiting.", kind: "command" };
-      const body = decrypt(draft.bodyEnc);
-      const firstLine = body.split("\n").find((l) => l.trim() && !/^subject:/i.test(l)) ?? body;
-      const [turn] = await getDb().insert(agentTurns).values({ userId, steps: 0 }).returning({ id: agentTurns.id });
-      const { id } = await logInteraction({
-        personId: draft.personId,
-        type: draft.channel === "email" ? "email" : "message",
-        summary: `Sent: ${firstLine.trim().slice(0, 120)}`,
-        notes: body,
-        occurredAt: now,
-      });
-      await getDb().update(pendingActions).set({ status: "approved", resolvedAt: now }).where(eq(pendingActions.id, draft.id));
-      await getDb()
-        .insert(agentActions)
-        .values({
-          userId,
-          turnId: turn.id,
-          tool: "approve_draft",
-          input: { draft_id: draft.id },
-          ok: true,
-          summary: `Logged the ${draft.channel} you sent to ${draft.name}`,
-          undo: { kind: "delete_interaction", id },
-        });
-      return { text: `Logged as sent to ${draft.name}.`, kind: "command" };
+      const done = await approveDraft(userId, command.draftId, now);
+      if (!done) return { text: "That draft was already logged or discarded.", kind: "command" };
+      await recordDraftAction(userId, m.id, "approve_draft", command.draftId, done);
+      return { text: `Logged as sent to ${done.name}.`, kind: "command" };
     }
-    case "reject":
-      if (!draft) return { text: "There's no draft waiting.", kind: "command" };
-      await getDb().update(pendingActions).set({ status: "rejected", resolvedAt: now }).where(eq(pendingActions.id, draft.id));
-      return { text: `Discarded the draft to ${draft.name}.`, kind: "command" };
-  }
-}
-
-/* ───────────── Agent turn ───────────── */
-
-export interface TurnInput {
-  userId: string;
-  messageId: string;
-  text: string;
-  now: Date;
-  /** Owner's phone, for replies. */
-  to: string;
-}
-
-export interface TurnResult {
-  reply: string;
-  turnId: string;
-  steps: number;
-  contextTokens: number;
-  draftIds: string[];
-}
-
-function textOf(m: ChatMessage): string {
-  return typeof m.content === "string" ? m.content : "";
-}
-
-export async function runTurn(deps: AgentDeps, input: TurnInput): Promise<TurnResult> {
-  const { userId, now } = input;
-  const started = Date.now();
-  const prefs = await getAgentPrefs(userId);
-  const history = (await recentMessages(userId, RECENT_MESSAGE_LIMIT + 1, { kinds: CONVERSATION_KINDS }))
-    .filter((m) => m.id !== input.messageId)
-    .slice(-RECENT_MESSAGE_LIMIT);
-  const ctx = await assembleContext({ userId, now, tz: prefs.timezone, history, newMessage: input.text });
-  const [turn] = await getDb()
-    .insert(agentTurns)
-    .values({ userId, inboundMessageId: input.messageId, contextTokens: ctx.contextTokens })
-    .returning({ id: agentTurns.id });
-
-  const toolCtx: ToolContext = { userId, turnId: turn.id, sourceMessageId: input.messageId, now, tz: prefs.timezone };
-  const tools = toolSpecs();
-  const messages: ChatMessage[] = [...ctx.messages];
-  const draftIds: string[] = [];
-  const done: string[] = [];
-  let reply = "";
-  let steps = 0;
-  let model: string | undefined;
-  let provider: string | undefined;
-  let error: string | undefined;
-
-  deps.adapter.sendTyping?.(input.to).catch(() => {});
-
-  try {
-    for (; steps < MAX_STEPS; steps++) {
-      const res = await deps.llm({ messages, tools, temperature: 0.3, maxTokens: 1500, timeoutMs: 45_000 });
-      model = res.model;
-      provider = res.provider;
-      const calls = (res.message.tool_calls ?? []).map((c, i) => ({ ...c, id: c.id || `call_${steps}_${i}` }));
-      if (calls.length === 0) {
-        reply = cleanReply(textOf(res.message));
-        steps++;
-        break;
-      }
-      messages.push({ role: "assistant", content: textOf(res.message) || null, tool_calls: calls });
-      for (const call of calls) {
-        const outcome = await executeToolCall(call, toolCtx);
-        if (outcome.draftId) draftIds.push(outcome.draftId);
-        if (outcome.ok && outcome.undo) done.push(outcome.summary);
-        messages.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: outcome.text });
-      }
+    case "reject": {
+      const done = await rejectDraft(userId, command.draftId, now);
+      if (!done) return { text: "That draft was already logged or discarded.", kind: "command" };
+      await recordDraftAction(userId, m.id, "reject_draft", command.draftId, done);
+      return { text: `Discarded the draft to ${done.name}.`, kind: "command" };
     }
-  } catch (err) {
-    error = err instanceof Error ? err.message : String(err);
-    console.error("[agent] model call failed", err);
+    case "which_draft": {
+      const drafts = await pendingDrafts(userId);
+      const list = drafts.slice(0, 5).map((d) => `${d.channel} to ${d.name}`).join(", ");
+      const verb = command.action === "approve" ? "sent" : "want to drop";
+      return { text: `You have ${drafts.length} drafts waiting (${list}). Which one did you ${verb}? Tap 👍 on the draft itself, or tell me who it was to.`, kind: "command" };
+    }
   }
-
-  if (!reply) {
-    reply = done.length
-      ? `Done: ${done.join("; ")}.`
-      : error
-        ? "I couldn't reach my model just now. Your message is saved; try again in a minute."
-        : "Got it.";
-  }
-
-  await send(deps, userId, input.to, reply, "chat");
-  for (const id of draftIds) {
-    const [d] = await getDb().select({ bodyEnc: pendingActions.bodyEnc }).from(pendingActions).where(eq(pendingActions.id, id));
-    if (d) await send(deps, userId, input.to, decrypt(d.bodyEnc), "draft");
-  }
-
-  await getDb()
-    .update(agentTurns)
-    .set({ model, provider, steps, latencyMs: Date.now() - started, error: error?.slice(0, 500) })
-    .where(eq(agentTurns.id, turn.id));
-
-  await maybeUpdateThreadSummary(deps, userId, now).catch((err) => console.error("[agent] summary update failed", err));
-
-  return { reply, turnId: turn.id, steps, contextTokens: ctx.contextTokens, draftIds };
-}
-
-/* ───────────── Rolling thread summary ───────────── */
-
-/** Fold messages that have left the recent window into the summary, in batches. */
-export const SUMMARY_BATCH = 10;
-
-export async function maybeUpdateThreadSummary(deps: AgentDeps, userId: string, now: Date): Promise<boolean> {
-  const window = await recentMessages(userId, RECENT_MESSAGE_LIMIT, { kinds: CONVERSATION_KINDS });
-  if (window.length < RECENT_MESSAGE_LIMIT) return false;
-  const windowStart = window[0].createdAt;
-  const existing = await threadSummary(userId);
-  const older = (await messagesBetween(userId, existing?.coversThrough ?? null, windowStart, CONVERSATION_KINDS)).filter(
-    (m) => m.createdAt < windowStart,
-  );
-  if (older.length < SUMMARY_BATCH) return false;
-
-  const transcript = older.map((m) => `${m.direction === "in" ? "Owner" : "Agent"} (${localDate(m.createdAt, "UTC")}): ${m.body}`).join("\n");
-  const res = await deps.llm({
-    messages: [
-      {
-        role: "system",
-        content:
-          "You maintain a running summary of a conversation between a fund manager (the owner) and their relationship-manager agent. Merge the new messages into the existing summary. Keep: open loops and promises, decisions, preferences the owner expressed, and who was discussed and why. Drop small talk and anything already recorded as done. Plain text, at most 1200 characters.",
-      },
-      { role: "user", content: `Existing summary:\n${existing?.summary ?? "(none)"}\n\nNew messages:\n${transcript}` },
-    ],
-    temperature: 0.2,
-    maxTokens: 600,
-    timeoutMs: 45_000,
-  });
-  const summary = cleanReply(textOf(res.message)).slice(0, 1500);
-  if (!summary) return false;
-  const coversThrough = older[older.length - 1].createdAt;
-  await getDb()
-    .insert(threadSummaries)
-    .values({ userId, summaryEnc: encrypt(summary), coversThrough, updatedAt: now })
-    .onConflictDoUpdate({ target: threadSummaries.userId, set: { summaryEnc: encrypt(summary), coversThrough, updatedAt: now } });
-  return true;
-}
-
-/* ───────────── Morning brief tick ───────────── */
-
-export interface BriefTickResult {
-  userId: string;
-  sent: boolean;
-  skipped?: BriefSkipReason | "no_phone" | "error";
-  preview?: string;
-}
-
-/**
- * Called by the cron route every ~15 minutes. Sends each owner's weekday
- * brief once, inside their window, within the unprompted budget (HA-8).
- */
-export async function runBriefTick(deps: AgentDeps, opts: { dryRun?: boolean } = {}): Promise<BriefTickResult[]> {
-  const now = deps.now();
-  const results: BriefTickResult[] = [];
-  for (const binding of await listVerifiedBindings()) {
-    const userId = binding.userId;
-    const result = await runAsOwner(userId, "cron", async (): Promise<BriefTickResult> => {
-      if (!binding.phone) return { userId, sent: false, skipped: "no_phone" };
-      const prefs = await getAgentPrefs(userId);
-      const skip = briefScheduleCheck(prefs, now, await unpromptedCountToday(userId, now, prefs.timezone));
-      if (skip) return { userId, sent: false, skipped: skip };
-      const data = await gatherBriefData(userId, now, prefs.timezone);
-      if (briefIsEmpty(data)) return { userId, sent: false, skipped: "nothing_due" };
-      if (opts.dryRun) {
-        const { text } = await composeBrief(deps.llm, data);
-        return { userId, sent: false, preview: text };
-      }
-      const logId = await claimBriefSlot(userId, now, prefs.timezone);
-      if (!logId) return { userId, sent: false, skipped: "already_sent" };
-      try {
-        const { text } = await composeBrief(deps.llm, data);
-        const res = await deps.adapter.sendText(binding.phone, text);
-        const messageId = await insertOutbound({ userId, provider: deps.adapter.name, providerMessageId: res.providerMessageId, body: text, kind: "brief" });
-        await attachNotificationMessage(logId, messageId);
-        return { userId, sent: true };
-      } catch (err) {
-        console.error("[agent] brief send failed", err);
-        await releaseNotification(logId);
-        return { userId, sent: false, skipped: "error" };
-      }
-    });
-    results.push(result);
-  }
-  return results;
 }

@@ -3,6 +3,7 @@ import { inWindow, localDate, localMinutes, parseHM, weekdayName, zonedParts } f
 import { getDashboard } from "@/server/queries/dashboard";
 import type { ChatRequest, ChatResult } from "./llm";
 import type { AgentPrefs } from "./store";
+import { stripReasoning } from "./text";
 import { shortId } from "./tools";
 import { and, eq, isNull, desc, inArray } from "drizzle-orm";
 import { getDb } from "@/db/client";
@@ -76,8 +77,9 @@ export async function gatherBriefData(userId: string, now: Date, tz: string): Pr
       facts: facts.filter((f) => f.personId === p.id).slice(0, 2).map((f) => f.fact),
     })),
     dueToday: [
+      // Undated follow-ups aren't "due today"; they surface through the dashboard instead.
       ...d.followUps
-        .filter((f) => !f.dueAt || localDate(f.dueAt, tz) <= today)
+        .filter((f) => f.dueAt && localDate(f.dueAt, tz) <= today)
         .map((f) => ({ text: f.description, person: f.personName, overdue: f.overdue })),
       ...d.reminders.filter((r) => localDate(r.dueAt, tz) <= today).map((r) => ({ text: r.reason, person: r.personName, overdue: r.overdue })),
     ].slice(0, 6),
@@ -116,6 +118,7 @@ End with: Reply "brief" anytime, or tell me who you talked to.`;
 export async function composeBrief(
   llm: (req: ChatRequest) => Promise<ChatResult>,
   d: BriefData,
+  timeoutMs = 45_000,
 ): Promise<{ text: string; usedModel: boolean }> {
   try {
     const res = await llm({
@@ -125,10 +128,10 @@ export async function composeBrief(
       ],
       temperature: 0.4,
       maxTokens: 700,
-      timeoutMs: 45_000,
+      timeoutMs,
     });
-    const text = typeof res.message.content === "string" ? res.message.content.replace(/<think>[\s\S]*?<\/think>/g, "").trim() : "";
-    if (text.length >= 20) return { text, usedModel: true };
+    const text = typeof res.message.content === "string" ? stripReasoning(res.message.content) : "";
+    if (text.length >= 20 && res.finishReason !== "length") return { text, usedModel: true };
   } catch (err) {
     console.error("[agent] brief composition failed; using template", err);
   }

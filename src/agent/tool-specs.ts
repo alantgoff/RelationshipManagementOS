@@ -10,7 +10,14 @@ import type { ToolSpec } from "./llm";
  * Schema sent to the model.
  */
 
-const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD");
+/** A real calendar date as YYYY-MM-DD; impossible dates (2026-02-30) are rejected instead of rolling over. */
+const isoDate = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD")
+  .refine((s) => {
+    const d = new Date(`${s}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+  }, "Not a real calendar date");
 const personId = z.string().min(1).describe("A person id from the working set or from find_people");
 
 export const toolSchemas = {
@@ -105,6 +112,14 @@ export const toolSchemas = {
       fact: z.string().min(1).max(500),
     }),
   },
+  recall: {
+    description:
+      "Search facts you remembered earlier. With no arguments, lists facts about the owner; with person_id, that person's facts; with query, facts containing those words.",
+    input: z.object({
+      query: z.string().optional().describe("Words to look for, e.g. 'kids school'"),
+      person_id: personId.optional(),
+    }),
+  },
   draft_message: {
     description:
       "Draft a message to someone, written in the owner's voice, for the owner to send themselves. Never sends anything. The draft is shown to the owner; they reply 👍 after sending it so it gets logged.",
@@ -113,6 +128,14 @@ export const toolSchemas = {
       channel: z.enum(["imessage", "email", "linkedin"]),
       intent: z.string().min(1).describe("What the message should accomplish"),
       body: z.string().min(1).max(2000).describe("The full draft text, ready to send. For email, start with a 'Subject:' line."),
+    }),
+  },
+  resolve_draft: {
+    description:
+      "Close a waiting draft by its id from the context: 'sent' when the owner says they sent it (logs it as an interaction), 'discard' when they don't want it. To change the wording, call draft_message again and discard the old one.",
+    input: z.object({
+      draft_id: z.string().min(1),
+      action: z.enum(["sent", "discard"]),
     }),
   },
 } as const;

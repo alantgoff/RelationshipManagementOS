@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { runBriefTick } from "@/agent/runtime";
+import { runBriefTick } from "@/agent/tick";
 import { createBindingCode, updateAgentPrefs } from "@/agent/store";
 import { getDb } from "@/db/client";
 import { channelMessages, notificationLog } from "@/db/schema";

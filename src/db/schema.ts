@@ -168,11 +168,10 @@ export const channelBindings = pgTable(
   (t) => [uniqueIndex("channel_bindings_phone_idx").on(t.phone), index("channel_bindings_code_idx").on(t.pendingCodeHash)],
 );
 
+/** Attachment metadata. The derived text (transcript, description, card) lives in the encrypted body. */
 export interface StoredMedia {
   kind: "audio" | "image" | "contact" | "file";
   contentType?: string;
-  /** Transcript, description or parsed card; provider URLs expire, so the binary is not kept. */
-  derivedText?: string;
   error?: string;
 }
 
@@ -189,14 +188,28 @@ export const channelMessages = pgTable(
     kind: text("kind").notNull().default("chat"),
     bodyEnc: text("body_enc").notNull(),
     media: jsonb("media").$type<StoredMedia[]>().notNull().default([]),
+    /** Inbound with attachments: null until they're processed and the body holds the full text. */
+    readyAt: timestamp("ready_at", { withTimezone: true }).defaultNow(),
     processedAt: timestamp("processed_at", { withTimezone: true }),
     error: text("error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     uniqueIndex("channel_messages_provider_msg_idx").on(t.provider, t.providerMessageId),
+    index("channel_messages_pending_idx").on(t.userId, t.direction, t.processedAt),
     index("channel_messages_user_created_idx").on(t.userId, t.createdAt),
   ],
+);
+
+/** Failed binding-code attempts from unknown numbers, for rate limiting (phone is an HMAC, not the number). */
+export const bindingFailures = pgTable(
+  "binding_failures",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    phoneHash: text("phone_hash").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("binding_failures_created_idx").on(t.createdAt), index("binding_failures_phone_idx").on(t.phoneHash, t.createdAt)],
 );
 
 /** One agent turn: an inbound message and everything the agent did for it. */

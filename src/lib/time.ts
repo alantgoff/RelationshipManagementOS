@@ -103,7 +103,15 @@ export function inWindow(minutes: number, start: number, end: number): boolean {
 export function zonedTimeToUtc(dateStr: string, hour: number, minute: number, tz: string): Date {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
   if (!m) throw new Error(`Invalid date ${dateStr}; use YYYY-MM-DD`);
-  const guess = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), hour, minute);
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d) {
+    throw new Error(`Invalid date ${dateStr}: no such day`);
+  }
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    throw new Error(`Invalid time ${hour}:${minute}`);
+  }
+  const guess = Date.UTC(y, mo - 1, d, hour, minute);
   const offsetAt = (t: number) => {
     const p = zonedParts(new Date(t), tz);
     return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute) - t;

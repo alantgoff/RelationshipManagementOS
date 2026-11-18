@@ -35,21 +35,38 @@ export class FakeLine implements ChannelAdapter {
   }
 }
 
-type Step = ChatMessage | ((req: ChatRequest) => ChatMessage) | Error;
+/** A cut-off response: the model hit max_tokens. */
+export interface Truncated {
+  truncated: ChatMessage;
+}
 
-/** A model that plays back a script and records every request. */
-export function scriptedModel(steps: Step[]) {
+type Step = ChatMessage | ((req: ChatRequest) => ChatMessage) | Error | Truncated;
+
+/** A model that plays back a script and records every request (and the most calls ever in flight at once). */
+export function scriptedModel(steps: Step[], opts: { delayMs?: number } = {}) {
   const requests: ChatRequest[] = [];
   let i = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
   const llm = async (req: ChatRequest): Promise<ChatResult> => {
     requests.push(JSON.parse(JSON.stringify(req)) as ChatRequest);
     const step = steps[i++];
-    if (step === undefined) throw new Error(`Script exhausted after ${i - 1} model calls`);
-    if (step instanceof Error) throw step;
-    const message = typeof step === "function" ? step(req) : step;
-    return { message, finishReason: "stop", provider: "primary", model: "scripted", latencyMs: 1 };
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
+      if (step === undefined) throw new Error(`Script exhausted after ${i - 1} model calls`);
+      if (step instanceof Error) throw step;
+      if (typeof step === "object" && "truncated" in step) {
+        return { message: step.truncated, finishReason: "length", provider: "primary", model: "scripted", latencyMs: 1 };
+      }
+      const message = typeof step === "function" ? step(req) : step;
+      return { message, finishReason: "stop", provider: "primary", model: "scripted", latencyMs: 1 };
+    } finally {
+      inFlight--;
+    }
   };
-  return { llm, requests, remaining: () => steps.length - i };
+  return { llm, requests, remaining: () => steps.length - i, maxInFlight: () => maxInFlight };
 }
 
 let callN = 0;

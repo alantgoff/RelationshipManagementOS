@@ -15,6 +15,13 @@
       "when": 1794882866231,
       "tag": "0001_headless_agent",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794885948801,
+      "tag": "0002_agent_hardening",
+      "breakpoints": true
     }
   ]
 }

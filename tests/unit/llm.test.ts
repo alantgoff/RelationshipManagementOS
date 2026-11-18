@@ -43,14 +43,63 @@ describe("chat", () => {
     expect((fetchMock.mock.calls[2] as unknown as [string])[0]).toBe("https://fallback.test/v1/chat/completions");
   });
 
-  it("does not fail over on a client error", async () => {
+  it("fails over when the primary returns a client error such as 404 (adapter missing)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("no such adapter", { status: 404 }))
+      .mockResolvedValueOnce(ok("from fallback"));
+    vi.stubGlobal("fetch", fetchMock);
+    const res = await chat({ messages: [{ role: "user", content: "x" }] }, providers);
+    expect(res.provider).toBe("fallback");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails over when the primary hangs, within the overall budget", async () => {
+    const fetchMock = vi.fn((url: string, init: RequestInit) => {
+      if (url.startsWith("https://primary.test")) {
+        return new Promise<Response>((_, reject) => {
+          init.signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "TimeoutError" })));
+        });
+      }
+      return Promise.resolve(ok("rescued"));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const started = Date.now();
+    const res = await chat({ messages: [{ role: "user", content: "x" }], timeoutMs: 600 }, providers);
+    expect(res.provider).toBe("fallback");
+    expect(res.message.content).toBe("rescued");
+    expect(Date.now() - started).toBeLessThan(600);
+  });
+
+  it("does not retry a bad request when there is no fallback", async () => {
     const fetchMock = vi.fn(async () => new Response("bad schema", { status: 400 }));
     vi.stubGlobal("fetch", fetchMock);
-    await expect(chat({ messages: [{ role: "user", content: "x" }] }, providers)).rejects.toMatchObject({
+    await expect(chat({ messages: [{ role: "user", content: "x" }] }, [providers[0]])).rejects.toMatchObject({
       status: 400,
       retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports every provider's error when all fail", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("down", { status: 503 })));
+    await expect(chat({ messages: [{ role: "user", content: "x" }], timeoutMs: 5_000 }, providers)).rejects.toThrow(/primary: HTTP 503.*fallback: HTTP 503/);
+  });
+
+  it("sends tool_choice none and provider extra body fields", async () => {
+    const fetchMock = vi.fn(async () => ok("ok"));
+    vi.stubGlobal("fetch", fetchMock);
+    await chat(
+      {
+        messages: [{ role: "user", content: "x" }],
+        tools: [{ type: "function", function: { name: "whats_due", description: "d", parameters: { type: "object" } } }],
+        toolChoice: "none",
+      },
+      [{ ...providers[0], extraBody: { chat_template_kwargs: { enable_thinking: false } } }],
+    );
+    const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.tool_choice).toBe("none");
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
   });
 
   it("includes tools with auto tool choice when given", async () => {
@@ -74,6 +123,19 @@ describe("chat", () => {
 });
 
 describe("providersFromEnv", () => {
+  it("parses EXTRA_BODY JSON and ignores invalid values", () => {
+    const p = providersFromEnv({
+      LLM_PRIMARY_BASE_URL: "https://a/v1",
+      LLM_PRIMARY_MODEL: "m1",
+      LLM_PRIMARY_EXTRA_BODY: '{"chat_template_kwargs":{"enable_thinking":false}}',
+      LLM_FALLBACK_BASE_URL: "https://b/v1",
+      LLM_FALLBACK_MODEL: "m2",
+      LLM_FALLBACK_EXTRA_BODY: "not json",
+    } as unknown as NodeJS.ProcessEnv);
+    expect(p[0].extraBody).toEqual({ chat_template_kwargs: { enable_thinking: false } });
+    expect(p[1].extraBody).toBeUndefined();
+  });
+
   it("reads primary and fallback, skipping incomplete ones", () => {
     const p = providersFromEnv({
       LLM_PRIMARY_BASE_URL: "https://a/v1",

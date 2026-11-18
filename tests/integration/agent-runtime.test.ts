@@ -8,8 +8,9 @@ import { encrypt } from "@/lib/crypto";
 import { createPerson } from "@/server/actions/people";
 import { updateSettings } from "@/server/actions/settings";
 import { getDashboard } from "@/server/queries/dashboard";
-import { maybeUpdateThreadSummary, receiveInbound, runTurn, SUMMARY_BATCH } from "@/agent/runtime";
-import { CONTEXT_BUDGET_TOKENS } from "@/agent/context";
+import { maybeUpdateThreadSummary, receiveInbound, runTurn } from "@/agent/runtime";
+import { CONTEXT_BUDGET_TOKENS, HISTORY_KEEP, HISTORY_MAX } from "@/agent/context";
+import { getMessage } from "@/agent/store";
 import { actAs, resetDb, teardownDb } from "./helpers";
 import { FakeLine, inbound, makeDeps, OWNER_PHONE, say, scriptedModel, text, THURSDAY_11AM_NY, toolCall, toolResults } from "./agent-harness";
 
@@ -177,14 +178,40 @@ describe("agent turns", () => {
     expect(turn.error).toMatch(/All providers failed/);
   });
 
-  it("ends a runaway tool loop with a summary of what was done", async () => {
+  it("after the last tool round, makes the model answer in text having seen every result", async () => {
     const { priya } = await seedPeople();
     const loop = Array.from({ length: 6 }, (_, k) => toolCall("remember", { person_id: shortId(priya), fact: `fact ${k}` }));
     const line = new FakeLine();
-    const deps = makeDeps(line, scriptedModel(loop).llm);
+    const model = scriptedModel([...loop, toolCall("remember", { person_id: shortId(priya), fact: "ignored" }), say("Saved six things about Priya.")]);
+    const deps = makeDeps(line, model.llm);
     await bindOwner(deps);
     await text(deps, "Priya likes many things");
+    const final = model.requests.at(-1)!;
+    expect(final.toolChoice).toBe("none");
+    expect(toolResults(final)).toHaveLength(6);
+    // A tool call returned despite tool_choice "none" is ignored, and the text step is never reached.
     expect(line.texts().at(-1)).toMatch(/^Done: Remembered about Priya Patel: fact 0;/);
+    expect(await getDb().select().from(agentActions)).toHaveLength(6);
+  });
+
+  it("uses the final text answer when the model gives one", async () => {
+    const { priya } = await seedPeople();
+    const loop = Array.from({ length: 6 }, (_, k) => toolCall("remember", { person_id: shortId(priya), fact: `fact ${k}` }));
+    const line = new FakeLine();
+    const deps = makeDeps(line, scriptedModel([...loop, say("Saved six things about Priya.")]).llm);
+    await bindOwner(deps);
+    await text(deps, "Priya likes many things");
+    expect(line.texts().at(-1)).toBe("Saved six things about Priya.");
+  });
+
+  it("never answers 'Got it.' when nothing was saved", async () => {
+    const line = new FakeLine();
+    const model = scriptedModel([say("<think>The owner wants"), say("   ")]);
+    const deps = makeDeps(line, model.llm);
+    await bindOwner(deps);
+    await text(deps, "log the call with Priya");
+    expect(line.texts().at(-1)).toMatch(/didn't manage to answer that, and nothing was saved/);
+    expect(line.texts().join("\n")).not.toMatch(/think|Got it/);
   });
 });
 
@@ -261,51 +288,88 @@ describe("drafts (HA-6)", () => {
     expect((await getDb().select().from(pendingActions))[0].status).toBe("approved");
     await text(deps, "undo");
     expect(await countRows(interactions)).toBe(0);
+    // Undo puts the draft back, so it can be approved again later.
+    expect((await getDb().select().from(pendingActions))[0].status).toBe("pending");
   });
 
-  it("skip discards it; approval words only count right after the draft", async () => {
+  it("skip discards it; 'yes' is about the wording, so it goes to the model", async () => {
     const { line, deps, model } = await draftForLeo();
     await text(deps, "skip");
     expect(line.texts().at(-1)).toBe("Discarded the draft to Leo Park.");
     expect((await getDb().select().from(pendingActions))[0].status).toBe("rejected");
+    await text(deps, "undo");
+    expect((await getDb().select().from(pendingActions))[0].status).toBe("pending");
     await text(deps, "yes");
     expect(line.texts().at(-1)).toBe("Sure."); // went to the model, not treated as approval
+    expect((await getDb().select().from(pendingActions))[0].status).toBe("pending");
     expect(model.remaining()).toBe(0);
   });
 });
 
 describe("context budget and thread summary (HA-7)", () => {
-  it("keeps context under budget with a long thread and folds old messages into a summary", async () => {
-    await seedPeople();
-    const line = new FakeLine();
-    const summaryModel = scriptedModel([say("Owner is raising Fund I; Priya keen; promised deck."), say("ok")]);
-    const deps = makeDeps(line, summaryModel.llm);
-    await bindOwner(deps);
+  const long = (k: number, chars: number) => `${k}: ${"Long update about the fund and many people. ".repeat(Math.ceil(chars / 45)).slice(0, chars)}`;
+
+  async function seedThread(n: number, chars: number) {
     const db = getDb();
-    const long = "Long update about the fund and many people. ".repeat(60);
-    for (let k = 0; k < 40; k++) {
+    for (let k = 0; k < n; k++) {
       await db.insert(channelMessages).values({
         userId: OWNER,
         provider: "test",
         providerMessageId: `seed-${k}`,
         direction: k % 2 ? "out" : "in",
         kind: "chat",
-        bodyEnc: encrypt(`${k}: ${long}`),
+        bodyEnc: encrypt(long(k, chars)),
         createdAt: new Date(Date.UTC(2026, 8, 1, 0, k)),
       });
     }
-    expect(await maybeUpdateThreadSummary(deps, OWNER, deps.now())).toBe(true);
-    const [s] = await db.select().from(threadSummaries);
-    expect(s.coversThrough.toISOString()).toBe(new Date(Date.UTC(2026, 8, 1, 0, 27)).toISOString());
+  }
 
-    const [msgRow] = await db
+  async function newMessage(body: string) {
+    const [row] = await getDb()
       .insert(channelMessages)
-      .values({ userId: OWNER, provider: "test", providerMessageId: "now", direction: "in", kind: "chat", bodyEnc: encrypt("hi") })
+      .values({ userId: OWNER, provider: "test", providerMessageId: `now-${body}`, direction: "in", kind: "chat", bodyEnc: encrypt(body) })
       .returning({ id: channelMessages.id });
-    const result = await runTurn(deps, { userId: OWNER, messageId: msgRow.id, text: "hi", now: deps.now(), to: OWNER_PHONE });
+    return (await getMessage(row.id))!;
+  }
+
+  it("trims the oldest history to stay under budget when the unsummarized thread is too big", async () => {
+    await seedPeople();
+    const line = new FakeLine();
+    const model = scriptedModel([say("ok")]);
+    const deps = makeDeps(line, model.llm);
+    await bindOwner(deps);
+    await seedThread(HISTORY_MAX, 4_000); // ~1k tokens each: 24k of history alone
+    const result = await runTurn(deps, { userId: OWNER, messages: [await newMessage("hi")], now: deps.now(), to: OWNER_PHONE, deadline: Date.now() + 50_000 });
     expect(result.contextTokens).toBeLessThanOrEqual(CONTEXT_BUDGET_TOKENS);
-    const sent = String(summaryModel.requests[1].messages.at(-1)?.content);
-    expect(sent).toContain("Earlier in this conversation (summary):\nOwner is raising Fund I");
-    expect(SUMMARY_BATCH).toBeGreaterThan(0);
+    const history = model.requests[0].messages.slice(1, -1);
+    const all = history.map((m) => String(m.content)).join("\n");
+    expect(all).toContain(`${HISTORY_MAX - 1}: Long update`); // newest kept
+    expect(all).not.toMatch(/(^|\n)0: Long update/); // oldest trimmed
+    expect(history.length).toBeLessThan(HISTORY_MAX);
+  });
+
+  it("folds the oldest messages into the summary, keeps the newest verbatim, and leaves no gap", async () => {
+    await seedPeople();
+    const line = new FakeLine();
+    const model = scriptedModel([say("Owner is raising Fund I; Priya keen; promised deck."), say("ok")]);
+    const deps = makeDeps(line, model.llm);
+    await bindOwner(deps);
+    await seedThread(40, 200);
+    expect(await maybeUpdateThreadSummary(deps, OWNER, deps.now())).toBe(true);
+    const [s] = await getDb().select().from(threadSummaries);
+    // 40 messages, keep 12: messages 0..27 folded.
+    expect(s.coversThrough.toISOString()).toBe(new Date(Date.UTC(2026, 8, 1, 0, 40 - HISTORY_KEEP - 1)).toISOString());
+    // The transcript uses the owner's local time (America/New_York), not UTC.
+    expect(String(model.requests[0].messages[1].content)).toContain("Owner (2026-08-31 20:00): 0: Long update");
+    // Nothing more to fold, and the cursor is exact: message 27 isn't folded twice.
+    expect(await maybeUpdateThreadSummary(deps, OWNER, deps.now())).toBe(false);
+
+    await runTurn(deps, { userId: OWNER, messages: [await newMessage("hi")], now: deps.now(), to: OWNER_PHONE, deadline: Date.now() + 50_000 });
+    const req = model.requests[1];
+    expect(String(req.messages.at(-1)?.content)).toContain("Earlier in this conversation (summary):\nOwner is raising Fund I");
+    const replay = req.messages.slice(1, -1).map((m) => String(m.content)).join("\n");
+    expect(replay).toContain("28: Long update");
+    expect(replay).toContain("39: Long update");
+    expect(replay).not.toContain("27: Long update");
   });
 });

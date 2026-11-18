@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { defaultAgentDeps, runBriefTick } from "@/agent/runtime";
+import { defaultAgentDeps } from "@/agent/runtime";
+import { runBriefTick } from "@/agent/tick";
 import { channelConfigured, getChannelAdapter } from "@/channels";
 import { safeEqual } from "@/lib/crypto";
 

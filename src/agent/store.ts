@@ -1,8 +1,7 @@
 import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { getDb, getLockClient } from "@/db/client";
-import { channelMessages, notificationLog, pendingActions, people, userSettings, type StoredMedia } from "@/db/schema";
+import { channelMessages, pendingActions, people, type StoredMedia } from "@/db/schema";
 import { decrypt, encrypt } from "@/lib/crypto";
-import { localDate, safeTimeZone } from "@/lib/time";
 
 /**
  * Persistence for the headless agent: the encrypted message log, per-owner
@@ -26,6 +25,15 @@ export {
   redeemBindingCode,
   unbind,
 } from "./binding";
+export {
+  attachNotificationMessage,
+  claimBriefSlot,
+  getAgentPrefs,
+  releaseNotification,
+  unpromptedCountToday,
+  updateAgentPrefs,
+  type AgentPrefs,
+} from "./prefs";
 
 /* ───────────── Per-owner serialization ───────────── */
 
@@ -72,6 +80,8 @@ export interface StoredMessage {
 
 /** Outbound error for a message that never reached the owner. */
 export const NOT_DELIVERED = "not delivered";
+/** An undelivered message whose content was later sent as a new message; left out of history. */
+export const RESENT = "not delivered (re-sent later)";
 
 /**
  * Insert an inbound message once. Returns null if this provider message id was
@@ -245,6 +255,7 @@ function conversationWhere(userId: string, after: Date | null, before: Date | nu
     eq(channelMessages.userId, userId),
     inArray(channelMessages.kind, kinds),
     or(eq(channelMessages.direction, "out"), isNotNull(channelMessages.processedAt))!,
+    sql`${channelMessages.error} is distinct from ${RESENT}`,
   ];
   if (after) where.push(afterCursor(after));
   if (before) where.push(lt(channelMessages.createdAt, before));
@@ -285,22 +296,50 @@ export async function countConversationSince(userId: string, after: Date | null,
   return Number(row?.n ?? 0);
 }
 
-/** The agent's latest message that reached the owner before `before`, if any. */
-export async function lastDeliveredOutbound(userId: string, before: Date): Promise<StoredMessage | null> {
-  const [row] = await getDb()
-    .select()
+/**
+ * What the agent last showed the owner before `before`: its latest message
+ * that reached them, with the rest of that run (everything delivered since the
+ * owner's message it answered; reactions don't count), newest first. A turn's
+ * reply and its drafts form one run.
+ */
+export async function lastAgentRun(userId: string, before: Date): Promise<StoredMessage[]> {
+  const db = getDb();
+  const delivered = (from: Date | null) =>
+    and(
+      eq(channelMessages.userId, userId),
+      eq(channelMessages.direction, "out"),
+      isNull(channelMessages.error),
+      lt(channelMessages.createdAt, before),
+      ...(from ? [sql`${channelMessages.createdAt} > ${from.toISOString()}::timestamptz`] : []),
+    );
+  const [last] = await db.select({ createdAt: channelMessages.createdAt }).from(channelMessages).where(delivered(null)).orderBy(desc(channelMessages.createdAt)).limit(1);
+  if (!last) return [];
+  const [answered] = await db
+    .select({ createdAt: channelMessages.createdAt })
     .from(channelMessages)
     .where(
-      and(eq(channelMessages.userId, userId), eq(channelMessages.direction, "out"), isNull(channelMessages.error), lt(channelMessages.createdAt, before)),
+      and(
+        eq(channelMessages.userId, userId),
+        eq(channelMessages.direction, "in"),
+        sql`${channelMessages.kind} <> 'reaction'`,
+        lt(channelMessages.createdAt, last.createdAt),
+      ),
     )
-    .orderBy(desc(channelMessages.createdAt), desc(channelMessages.id))
+    .orderBy(desc(channelMessages.createdAt))
     .limit(1);
-  return row ? toStored(row) : null;
+  const rows = await db
+    .select()
+    .from(channelMessages)
+    .where(delivered(answered?.createdAt ?? null))
+    .orderBy(desc(channelMessages.createdAt), desc(channelMessages.id))
+    .limit(20);
+  return rows.map(toStored);
 }
 
 /**
- * Replies that never reached the owner since `since`, oldest first, skipping
- * any already superseded by a later message that did reach them.
+ * Messages that never reached the owner since `since`, oldest first, unless
+ * superseded: the owner wrote again afterwards and got a reply that did reach
+ * them. Parts and drafts of the same reply never supersede each other.
  */
 export async function undeliveredReplies(userId: string, since: Date): Promise<StoredMessage[]> {
   const rows = await getDb()
@@ -312,19 +351,65 @@ export async function undeliveredReplies(userId: string, since: Date): Promise<S
         eq(channelMessages.direction, "out"),
         eq(channelMessages.error, NOT_DELIVERED),
         gte(channelMessages.createdAt, since),
-        sql`not exists (select 1 from channel_messages later where later.user_id = ${userId} and later.direction = 'out' and later.error is null and later.created_at > ${channelMessages.createdAt})`,
+        sql`not exists (
+          select 1 from channel_messages owner_msg
+          join channel_messages answer on answer.user_id = owner_msg.user_id
+            and answer.direction = 'out' and answer.error is null and answer.created_at > owner_msg.created_at
+          where owner_msg.user_id = ${userId} and owner_msg.direction = 'in' and owner_msg.kind <> 'reaction'
+            and owner_msg.created_at > ${channelMessages.createdAt}
+        )`,
       ),
     )
     .orderBy(asc(channelMessages.createdAt), asc(channelMessages.id));
   return rows.map(toStored);
 }
 
-/** Record the outcome of re-sending an undelivered message. */
-export async function markRedelivered(id: string, outcome: { providerMessageId?: string } | "failed"): Promise<void> {
-  await getDb()
+/** Claim an undelivered message for one re-send attempt; false if someone else already did. */
+export async function claimForResend(id: string): Promise<boolean> {
+  const rows = await getDb()
     .update(channelMessages)
-    .set(outcome === "failed" ? { error: `${NOT_DELIVERED} (gave up)` } : { error: null, providerMessageId: outcome.providerMessageId ?? null })
-    .where(eq(channelMessages.id, id));
+    .set({ error: `${NOT_DELIVERED} (re-sending)` })
+    .where(and(eq(channelMessages.id, id), eq(channelMessages.error, NOT_DELIVERED)))
+    .returning({ id: channelMessages.id });
+  return rows.length === 1;
+}
+
+/**
+ * Record a claimed re-send. A delivered re-send becomes a new message at the
+ * time it actually arrived (so history and "just shown" stay truthful) and the
+ * original is retired; a failed one is given up on.
+ */
+export async function finishResend(m: StoredMessage, userId: string, provider: string, outcome: { providerMessageId?: string } | "failed"): Promise<void> {
+  if (outcome === "failed") {
+    await getDb().update(channelMessages).set({ error: `${NOT_DELIVERED} (gave up)` }).where(eq(channelMessages.id, m.id));
+    return;
+  }
+  await getDb().transaction(async (tx) => {
+    await tx.update(channelMessages).set({ error: RESENT }).where(eq(channelMessages.id, m.id));
+    const now = new Date();
+    await tx.insert(channelMessages).values({
+      userId,
+      provider,
+      providerMessageId: outcome.providerMessageId ?? null,
+      direction: "out",
+      kind: m.kind,
+      bodyEnc: encrypt(m.body),
+      readyAt: now,
+      processedAt: now,
+      refId: m.refId,
+    });
+  });
+}
+
+/** When the owner's oldest still-queued message arrived, if any. */
+export async function oldestQueuedInbound(userId: string): Promise<Date | null> {
+  const [row] = await getDb()
+    .select({ createdAt: channelMessages.createdAt })
+    .from(channelMessages)
+    .where(and(eq(channelMessages.userId, userId), eq(channelMessages.direction, "in"), isNull(channelMessages.processedAt), isNull(channelMessages.error)))
+    .orderBy(asc(channelMessages.createdAt))
+    .limit(1);
+  return row?.createdAt ?? null;
 }
 
 export async function getMessage(id: string): Promise<StoredMessage | null> {
@@ -380,69 +465,4 @@ export async function expireOldDrafts(userId: string, now: Date): Promise<number
     .where(and(eq(pendingActions.userId, userId), eq(pendingActions.status, "pending"), lt(pendingActions.createdAt, cutoff)))
     .returning({ id: pendingActions.id });
   return rows.length;
-}
-
-/* ───────────── Agent preferences and budget ───────────── */
-
-export interface AgentPrefs {
-  timezone: string;
-  proactiveEnabled: boolean;
-  pausedUntil: Date | null;
-  briefTime: string;
-  quietStart: string;
-  quietEnd: string;
-  dailyUnpromptedLimit: number;
-}
-
-export async function getAgentPrefs(userId: string): Promise<AgentPrefs> {
-  const [row] = await getDb().select().from(userSettings).where(eq(userSettings.userId, userId));
-  return {
-    timezone: safeTimeZone(row?.timezone),
-    proactiveEnabled: row?.proactiveEnabled ?? true,
-    pausedUntil: row?.pausedUntil ?? null,
-    briefTime: row?.briefTime ?? "07:30",
-    quietStart: row?.quietStart ?? "21:00",
-    quietEnd: row?.quietEnd ?? "07:00",
-    dailyUnpromptedLimit: row?.dailyUnpromptedLimit ?? 3,
-  };
-}
-
-export async function updateAgentPrefs(
-  userId: string,
-  patch: Partial<Pick<AgentPrefs, "proactiveEnabled" | "pausedUntil" | "briefTime" | "quietStart" | "quietEnd" | "dailyUnpromptedLimit">>,
-): Promise<void> {
-  await getDb()
-    .insert(userSettings)
-    .values({ userId, ...patch })
-    .onConflictDoUpdate({ target: userSettings.userId, set: { ...patch, updatedAt: new Date() } });
-}
-
-/** Unprompted messages already sent on the owner's local date. */
-export async function unpromptedCountToday(userId: string, now: Date, tz: string): Promise<number> {
-  const [row] = await getDb()
-    .select({ n: sql<number>`count(*)` })
-    .from(notificationLog)
-    .where(and(eq(notificationLog.userId, userId), eq(notificationLog.localDate, localDate(now, tz))));
-  return Number(row?.n ?? 0);
-}
-
-/**
- * Claim today's brief slot before composing it, so two overlapping cron ticks
- * can't both send. Returns null if another tick already claimed it.
- */
-export async function claimBriefSlot(userId: string, now: Date, tz: string): Promise<string | null> {
-  const rows = await getDb()
-    .insert(notificationLog)
-    .values({ userId, kind: "brief", localDate: localDate(now, tz), sentAt: now })
-    .onConflictDoNothing()
-    .returning({ id: notificationLog.id });
-  return rows[0]?.id ?? null;
-}
-
-export async function attachNotificationMessage(logId: string, messageId: string): Promise<void> {
-  await getDb().update(notificationLog).set({ messageId }).where(eq(notificationLog.id, logId));
-}
-
-export async function releaseNotification(logId: string): Promise<void> {
-  await getDb().delete(notificationLog).where(eq(notificationLog.id, logId));
 }

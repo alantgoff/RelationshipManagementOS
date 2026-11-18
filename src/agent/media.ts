@@ -180,13 +180,9 @@ export function composeInboundText(text: string, media: ProcessedMedia[], maxCha
   if (full.length <= maxChars) return full;
   const close = "…\n</attachment>";
   let cut = full.slice(0, maxChars - close.length);
+  // Attachment text is escaped, so a "<" with no ">" after it is a tag the cut split: drop the fragment.
+  const lt = cut.lastIndexOf("<");
+  if (lt >= 0 && !cut.includes(">", lt)) cut = cut.slice(0, lt);
   const open = (cut.match(/<attachment\b/g) ?? []).length - (cut.match(/<\/attachment>/g) ?? []).length;
-  if (open > 0) {
-    // Don't end inside the opening tag itself.
-    const lastOpen = cut.lastIndexOf("<attachment");
-    if (cut.indexOf(">", lastOpen) < 0) cut = cut.slice(0, lastOpen);
-    else cut += close;
-    return cut.trimEnd();
-  }
-  return `${cut}…`;
+  return open > 0 ? `${cut.trimEnd()}${close}` : `${cut.trimEnd()}…`;
 }

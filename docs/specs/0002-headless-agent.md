@@ -87,12 +87,23 @@ Schemas: `src/agent/tool-specs.ts`.
   message body, and image or card text reaches the model inside `<attachment>`
   tags as data, never instructions. Provider URLs expire.
 - One owner's messages are handled one at a time under a Postgres advisory
-  lock; a burst of texts becomes one turn. Work after the webhook has a 50s
-  budget (route `maxDuration` 60). A message a killed run left behind is picked
-  up by the next tick, which reports what was already saved instead of redoing it.
-- Drafts: the owner sends them; 👍 / "sent" logs the one just shown (or the only
-  one waiting), a tapback logs the draft it quotes, "skip" discards; "yes" or
-  "looks good" go to the model, which can call `resolve_draft`. Drafts expire
+  lock; a burst of texts becomes one turn, and a text sent right after an
+  attachment waits for it so the two are answered together. Work after the
+  webhook has a 50s budget (route `maxDuration` 60). A run that ends with
+  messages still queued hands them to `/api/cron/drain` (needs `CRON_SECRET`
+  and `APP_URL` set in the app's environment; on Vercel the production domain
+  is used if `APP_URL` is unset); otherwise the next tick picks them up. A
+  message a killed run left behind is reported with what was already saved
+  instead of being redone. Replies the provider failed to deliver are re-sent
+  once by the tick within 30 minutes, unless a later reply superseded them.
+- HA-7: the assembled prompt is kept under 14k estimated tokens and every model
+  call in a turn under 20k; tool results are cut or skipped to stay under it,
+  and the conversation is folded into the rolling summary by count or size.
+- Drafts: the owner sends them; 👍 / "sent" logs the draft just shown (when the
+  agent's last message showed exactly one), a tapback logs the one draft it
+  quotes, "skip" discards it; anything less certain ("sent" later on, "yes",
+  "looks good") goes to the model, which sees the drafts waiting and can ask or
+  call `resolve_draft`. Drafts expire
   after 7 days. `undo` reverses the latest turn with changes (within 24h),
   restoring only fields nobody has changed since.
 - Tests: `tests/integration/agent-*.test.ts` run the real runtime against

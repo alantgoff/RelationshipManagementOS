@@ -33,18 +33,35 @@ function phoneHash(phone: string): string {
   return createHmac("sha256", pepper()).update(`phone:${phone}`).digest("hex");
 }
 
-/** Create (or replace) a 6-digit code the owner texts to the line to bind their phone. */
+const liveCode = (hash: string, now: Date) =>
+  and(eq(channelBindings.pendingCodeHash, hash), sql`${channelBindings.codeExpiresAt} > ${now.toISOString()}::timestamptz`);
+
+/**
+ * Create (or replace) a 6-digit code the owner texts to the line to bind their
+ * phone. Never one that another owner's live code already uses, so a code
+ * always names exactly one account.
+ */
 export async function createBindingCode(userId: string, provider: string, now = new Date()): Promise<{ code: string; expiresAt: Date }> {
-  const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
   const expiresAt = new Date(now.getTime() + BINDING_CODE_TTL_MS);
-  await getDb()
-    .insert(channelBindings)
-    .values({ userId, provider, pendingCodeHash: codeHash(code), codeExpiresAt: expiresAt })
-    .onConflictDoUpdate({
-      target: channelBindings.userId,
-      set: { provider, pendingCodeHash: codeHash(code), codeExpiresAt: expiresAt, updatedAt: now },
-    });
-  return { code, expiresAt };
+  return getDb().transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('agent:binding'))`);
+    for (let attempt = 0; ; attempt++) {
+      const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+      const hash = codeHash(code);
+      const [taken] = await tx
+        .select({ userId: channelBindings.userId })
+        .from(channelBindings)
+        .where(and(liveCode(hash, now), sql`${channelBindings.userId} <> ${userId}`))
+        .limit(1);
+      if (taken && attempt < 50) continue;
+      if (taken) throw new Error("could not find a free binding code");
+      await tx
+        .insert(channelBindings)
+        .values({ userId, provider, pendingCodeHash: hash, codeExpiresAt: expiresAt })
+        .onConflictDoUpdate({ target: channelBindings.userId, set: { provider, pendingCodeHash: hash, codeExpiresAt: expiresAt, updatedAt: now } });
+      return { code, expiresAt };
+    }
+  });
 }
 
 /** True when this unknown number, or the line as a whole, has failed too many codes recently. */
@@ -81,11 +98,9 @@ export async function redeemBindingCode(code: string, phone: string, now = new D
     // One attempt at a time across the line: check, redeem and count as a unit.
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('agent:binding'))`);
     if (await bindingThrottled(tx, phone, now)) return null;
-    const [pending] = await tx
-      .select()
-      .from(channelBindings)
-      .where(and(eq(channelBindings.pendingCodeHash, hash), sql`${channelBindings.codeExpiresAt} > ${now.toISOString()}::timestamptz`))
-      .limit(1);
+    // createBindingCode keeps live codes unique; if two ever matched, bind neither.
+    const matches = await tx.select().from(channelBindings).where(liveCode(hash, now)).limit(2);
+    const pending = matches.length === 1 ? matches[0] : null;
     let userId: string | null = null;
     if (pending) {
       const [owner] = await tx.select({ userId: channelBindings.userId }).from(channelBindings).where(eq(channelBindings.phone, phone));

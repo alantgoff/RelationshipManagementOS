@@ -288,20 +288,25 @@ const IMPLEMENTATIONS: { [N in ToolName]: (a: Args<N>, ctx: ToolContext) => Prom
 /** Read-only tools are not recorded as undoable actions but still appear in `why`. */
 export const READ_ONLY_TOOLS: ReadonlySet<ToolName> = new Set(["find_people", "get_person", "whats_due", "recall"]);
 
+/** An id, enum or number: safe to keep in the audit copy of any call. */
+const isSafeScalar = (v: unknown) =>
+  v === null || typeof v === "number" || typeof v === "boolean" || (typeof v === "string" && v.length <= 40 && !/\s/.test(v));
+
 /**
- * The audit copy of a call's arguments (plaintext jsonb). Message bodies stay
- * only in encrypted storage: for draft_message, and for any call that failed
- * validation or named an unknown tool (where a body may sit under another
- * key), long strings are replaced by their length.
+ * The audit copy of a call's arguments (plaintext jsonb). Message text stays
+ * only in encrypted storage. Valid calls of other tools are kept as given (the
+ * same data the CRM stores). A draft_message, valid or not, never keeps its body,
+ * nested values or long text; a call that failed validation or named an unknown
+ * tool (where a message may sit under any key) keeps only ids, enums and numbers.
  */
 function auditInput(name: string, args: Record<string, unknown> | null, valid: boolean): Record<string, unknown> {
   if (!args) return {};
   if (valid && name !== "draft_message") return args;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args)) {
-    const keepAsIs = valid ? key !== "body" : typeof value !== "object" || value === null;
-    if (typeof value === "string" && (!keepAsIs || value.length > 80)) out[key] = `[${value.length} characters, not stored]`;
-    else out[key] = keepAsIs ? value : "[not stored]";
+    const keep = valid ? key !== "body" && (isSafeScalar(value) || (typeof value === "string" && value.length <= 80)) : isSafeScalar(value);
+    if (keep) out[key] = value;
+    else out[key] = typeof value === "string" ? `[${value.length} characters, not stored]` : "[not stored]";
   }
   return out;
 }

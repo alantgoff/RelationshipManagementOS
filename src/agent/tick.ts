@@ -9,11 +9,13 @@ import {
   insertOutbound,
   listVerifiedBindings,
   markProcessed,
-  markRedelivered,
+  claimForResend,
+  finishResend,
   releaseNotification,
   stuckInbound,
   undeliveredReplies,
   unpromptedCountToday,
+  withOwnerLock,
 } from "./store";
 import { maybeUpdateThreadSummary, SEND_RESERVE_MS, sendOut } from "./turn";
 
@@ -46,22 +48,32 @@ export interface BriefTickResult {
   redelivered?: number;
 }
 
-/** Re-send replies that never reached the owner and weren't superseded. One try each. */
+/**
+ * Re-send messages that never reached the owner and weren't superseded, in
+ * order. Runs under the owner's lock, so it can't interleave with a turn, and
+ * claims each message first, so overlapping ticks never send one twice. At
+ * most one try per message.
+ */
 async function redeliver(deps: AgentDeps, userId: string, phone: string): Promise<number> {
-  const missed = await undeliveredReplies(userId, new Date(Date.now() - REDELIVER_WINDOW_MS));
-  let sent = 0;
-  for (const m of missed) {
-    try {
-      const { providerMessageId } = await deps.adapter.sendText(phone, m.body);
-      await markRedelivered(m.id, { providerMessageId });
-      sent++;
-    } catch (err) {
-      console.error("[agent] re-send failed", err);
-      await markRedelivered(m.id, "failed");
-      break; // keep the rest in order for the next tick
+  const sent = await withOwnerLock(userId, 10_000, async () => {
+    const missed = await undeliveredReplies(userId, new Date(Date.now() - REDELIVER_WINDOW_MS));
+    let n = 0;
+    for (const m of missed) {
+      if (!(await claimForResend(m.id))) continue;
+      let res: { providerMessageId?: string };
+      try {
+        res = await deps.adapter.sendText(phone, m.body);
+      } catch (err) {
+        console.error("[agent] re-send failed", err);
+        await finishResend(m, userId, deps.adapter.name, "failed");
+        break; // the rest stay queued, in order, for the next tick
+      }
+      await finishResend(m, userId, deps.adapter.name, res);
+      n++;
     }
-  }
-  return sent;
+    return n;
+  });
+  return sent ?? 0;
 }
 
 async function recoverStuck(deps: AgentDeps, userId: string, phone: string, tickDeadline: number): Promise<number> {

@@ -1,3 +1,5 @@
+import { splitMessage } from "./text";
+
 /**
  * Commands handled by code, never by the model (spec 0002 §2), so they work
  * even when the model is down and can't be talked out of by a prompt.
@@ -41,9 +43,13 @@ export interface CommandContext {
 const MAX_PAUSE_MINUTES = 14 * 24 * 60;
 
 const QUOTE = `["“”'‘’]`;
-/** iMessage tapbacks relayed as text: Liked “…”, or on newer iOS: Reacted 👍 to “…”. */
-const TAPBACK = new RegExp(`^(liked|loved|disliked|emphasized|laughed at|questioned)\\s+${QUOTE}([\\s\\S]*?)${QUOTE}?$`, "iu");
-const REACTED = new RegExp(`^reacted\\s+(\\S+)\\s+to\\s+${QUOTE}([\\s\\S]*?)${QUOTE}?$`, "iu");
+/**
+ * iMessage tapbacks relayed as text: Liked “…”, or on newer iOS: Reacted 👍 to “…”.
+ * The whole message is the quote, so it must end with the closing quote (or the
+ * ellipsis of a cut-off one); `Loved "Sapiens" - remind me to thank Dana` is a request.
+ */
+const TAPBACK = new RegExp(`^(liked|loved|disliked|emphasized|laughed at|questioned)\\s+${QUOTE}([^“”"]*?)(?:${QUOTE}|…)$`, "iu");
+const REACTED = new RegExp(`^reacted\\s+(\\S+)\\s+to\\s+${QUOTE}([^“”"]*?)(?:${QUOTE}|…)$`, "iu");
 
 const SKIN = "[\\u{1F3FB}-\\u{1F3FF}]?";
 const THUMBS_UP = new RegExp(`^(?:👍${SKIN}|✅)+$`, "u");
@@ -75,20 +81,25 @@ const normQuote = (s: string) =>
     .trim()
     .toLowerCase();
 
+/** Where a tapback quote can start: the draft, any of its lines, and each bubble it was sent as. */
+function quoteStarts(body: string): string[] {
+  const lines = body.split("\n");
+  return [...lines.map((_, i) => lines.slice(i).join(" ")), ...splitMessage(body)].map(normQuote);
+}
+
 /**
- * The pending draft a tapback quotes, if any. iMessage quotes the start of the
- * message, sometimes truncated, so the quote must open the draft or one of its
- * lines (a draft may start with a "Subject:" line).
+ * The pending draft a tapback quotes, if exactly one matches. iMessage quotes
+ * the start of the bubble, sometimes truncated, so the quote must open the
+ * draft, one of its lines (a draft may start with a "Subject:" line), or one of
+ * the bubbles a long draft was split into. Drafts sharing an opening are
+ * ambiguous: returns "ambiguous" and the model asks which.
  */
-export function draftQuotedBy(quote: string, drafts: DraftRef[]): DraftRef | null {
+export function draftQuotedBy(quote: string, drafts: DraftRef[]): DraftRef | "ambiguous" | null {
   const q = normQuote(quote);
   if (q.length < 6) return null;
-  return (
-    drafts.find((d) => {
-      const lines = d.body.split("\n");
-      return lines.some((_, i) => normQuote(lines.slice(i).join(" ")).startsWith(q));
-    }) ?? null
-  );
+  const hits = drafts.filter((d) => quoteStarts(d.body).some((start) => start.startsWith(q)));
+  if (hits.length > 1) return "ambiguous";
+  return hits[0] ?? null;
 }
 
 /** iMessage relays an un-tap as text, e.g. Removed a like from “…”. */
@@ -121,6 +132,7 @@ export function parseCommand(raw: string, ctx: CommandContext): Command | null {
     const positive = verb === "liked" || verb === "loved" || /^(👍|❤️|❤|✅)/u.test(verb);
     const negative = verb === "disliked" || /^👎/u.test(verb);
     const draft = positive || negative ? draftQuotedBy(quote, ctx.drafts) : null;
+    if (draft === "ambiguous") return null;
     if (draft && positive) return { kind: "approve", draftId: draft.id };
     if (draft && negative) return { kind: "reject", draftId: draft.id };
     return { kind: "reaction" };

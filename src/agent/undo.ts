@@ -179,17 +179,21 @@ export async function undoLastTurn(userId: string, now = new Date()): Promise<st
 /** Explain the most recent turn: the tools it used and what each returned. */
 export async function explainLastTurn(userId: string): Promise<string> {
   const db = getDb();
-  const [[turn], [brief]] = await Promise.all([
-    db.select({ id: agentTurns.id, createdAt: agentTurns.createdAt }).from(agentTurns).where(eq(agentTurns.userId, userId)).orderBy(desc(agentTurns.createdAt)).limit(1),
+  const latestOut = (kinds: string[]) =>
     db
       .select({ createdAt: channelMessages.createdAt })
       .from(channelMessages)
-      .where(and(eq(channelMessages.userId, userId), eq(channelMessages.direction, "out"), eq(channelMessages.kind, "brief"), isNull(channelMessages.error)))
+      .where(and(eq(channelMessages.userId, userId), eq(channelMessages.direction, "out"), inArray(channelMessages.kind, kinds), isNull(channelMessages.error)))
       .orderBy(desc(channelMessages.createdAt))
-      .limit(1),
+      .limit(1);
+  const [[turn], [brief], [answer]] = await Promise.all([
+    db.select({ id: agentTurns.id, createdAt: agentTurns.createdAt }).from(agentTurns).where(eq(agentTurns.userId, userId)).orderBy(desc(agentTurns.createdAt)).limit(1),
+    latestOut(["brief"]),
+    latestOut(["chat", "draft"]),
   ]);
-  // A brief writes no turn; don't pass off an older turn as the basis for it.
-  if (brief && (!turn || brief.createdAt > turn.createdAt)) {
+  // A brief writes no turn; don't pass off an older turn as the basis for it. A turn
+  // starts before its reply goes out, so compare with the reply, not the turn's start.
+  if (brief && (!turn || (brief.createdAt > turn.createdAt && (!answer || brief.createdAt > answer.createdAt)))) {
     return "My last message was your brief: it comes straight from your records (follow-ups and reminders due, and who's going cold) and didn't change anything.";
   }
   if (!turn) return "I haven't answered anything yet.";

@@ -13,7 +13,7 @@ import {
   getAgentPrefs,
   getBinding,
   insertInbound,
-  lastDeliveredOutbound,
+  lastAgentRun,
   markProcessed,
   markReady,
   pendingDrafts,
@@ -23,7 +23,7 @@ import {
   withOwnerLock,
   type StoredMessage,
 } from "./store";
-import { maybeUpdateThreadSummary, runTurn, SEND_RESERVE_MS, sendOut } from "./turn";
+import { MAX_TURN_INPUT_CHARS, maybeUpdateThreadSummary, runTurn, SEND_RESERVE_MS, sendOut } from "./turn";
 import { explainLastTurn, undoLastTurn } from "./undo";
 
 export { cleanReply, splitMessage } from "./text";
@@ -56,19 +56,32 @@ export function defaultAgentDeps(adapter: ChannelAdapter): AgentDeps {
   };
 }
 
-/** Hand-off over HTTP to this deployment's drain route, when it knows its own URL and the cron secret. */
-function drainHandOffFromEnv(): AgentDeps["handOff"] {
-  const secret = process.env.CRON_SECRET;
-  const base = process.env.APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
-  if (!secret || !base) return undefined;
+/**
+ * Hand-off over HTTP to this app's drain route, when it knows its public URL
+ * (APP_URL, else Vercel's production domain) and the cron secret. Per-deployment
+ * VERCEL_URL hosts sit behind Vercel's deployment protection, so they're used
+ * only with a protection bypass secret. Redirects are refused, so the bearer
+ * secret never follows one and a login page never counts as success.
+ */
+export function drainHandOffFromEnv(env: NodeJS.ProcessEnv = process.env): AgentDeps["handOff"] {
+  const secret = env.CRON_SECRET;
+  const bypass = env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  const host = env.APP_URL || (env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${env.VERCEL_PROJECT_PRODUCTION_URL}` : "") || (bypass && env.VERCEL_URL ? `https://${env.VERCEL_URL}` : "");
+  if (!secret || !host) return undefined;
+  const url = new URL("/api/cron/drain", host);
   return async (userId) => {
-    const res = await fetch(new URL("/api/cron/drain", base), {
+    const res = await fetch(url, {
       method: "POST",
-      headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${secret}`,
+        "content-type": "application/json",
+        ...(bypass ? { "x-vercel-protection-bypass": bypass } : {}),
+      },
       body: JSON.stringify({ userId }),
+      redirect: "manual",
       signal: AbortSignal.timeout(5_000),
     });
-    if (!res.ok) throw new Error(`drain hand-off failed: ${res.status}`);
+    if (res.status !== 202) throw new Error(`drain hand-off failed: ${res.status}`);
   };
 }
 
@@ -193,19 +206,34 @@ export async function drainQueue(deps: AgentDeps, userId: string, to: string, de
   });
 }
 
-/** What a message means as a command, given the drafts the owner had seen when they sent it. */
+/** What a message means as a command, given what the owner had seen when they sent it. */
 async function commandFor(userId: string, m: StoredMessage): Promise<Command | null> {
   if (m.media.length) return null; // attachments always go to the model
-  const [pending, lastOut] = await Promise.all([pendingDrafts(userId), lastDeliveredOutbound(userId, m.createdAt)]);
+  const [pending, run] = await Promise.all([pendingDrafts(userId), lastAgentRun(userId, m.createdAt)]);
   // Drafts created after this message (by a turn still catching up) aren't what it refers to.
   const drafts = pending.filter((d) => d.createdAt < m.createdAt).map((d) => ({ id: d.id, body: d.body }));
-  const shownDraft = lastOut?.kind === "draft" && lastOut.refId ? (drafts.find((d) => d.id === lastOut.refId) ?? null) : null;
+  // "Just shown" only when the agent's last run ended on a draft and showed no other one.
+  const lastOut = run[0];
+  const shownIds = new Set(run.filter((o) => o.kind === "draft" && o.refId).map((o) => o.refId));
+  const shownDraft = lastOut?.kind === "draft" && lastOut.refId && shownIds.size === 1 ? (drafts.find((d) => d.id === lastOut.refId) ?? null) : null;
   const lastOutboundAsked = lastOut?.kind === "chat" && /\?\s*$/.test(lastOut.body);
   return parseCommand(m.body, { drafts, shownDraft, lastOutboundAsked });
 }
 
 /** Handle the next unit of work: one command, or one run of consecutive chat messages. Returns false to stop. */
 async function processNext(deps: AgentDeps, userId: string, to: string, ready: StoredMessage[], deadline: number, attempted: Set<string>): Promise<boolean> {
+  // A turn already started for queued messages means a previous run was killed midway.
+  // Checked across the whole queue: what counts as a command can change between runs.
+  const readyIds = ready.map((m) => m.id);
+  const prior = await getDb().select({ id: agentTurns.id, inbound: agentTurns.inboundMessageId }).from(agentTurns).where(inArray(agentTurns.inboundMessageId, readyIds));
+  if (prior.length) {
+    // Report the messages that killed run covered; later ones get a turn of their own.
+    const covered = readyIds.slice(0, Math.max(...prior.map((t) => readyIds.indexOf(t.inbound!))) + 1);
+    covered.forEach((id) => attempted.add(id));
+    await reportInterrupted(deps, userId, to, covered, prior.map((t) => t.id), deadline);
+    return true;
+  }
+
   const first = ready[0];
   const command = await commandFor(userId, first);
   if (command) {
@@ -223,22 +251,14 @@ async function processNext(deps: AgentDeps, userId: string, to: string, ready: S
   }
 
   const run = [first];
+  let chars = first.body.length;
   for (const m of ready.slice(1)) {
-    if (await commandFor(userId, m)) break;
+    // Keep one turn's input bounded; the rest is answered next.
+    if (chars + m.body.length > MAX_TURN_INPUT_CHARS || (await commandFor(userId, m))) break;
     run.push(m);
+    chars += m.body.length;
   }
   const ids = run.map((m) => m.id);
-
-  // A turn already started for these messages means a previous run was killed midway.
-  const prior = await getDb().select({ id: agentTurns.id, inbound: agentTurns.inboundMessageId }).from(agentTurns).where(inArray(agentTurns.inboundMessageId, ids));
-  if (prior.length) {
-    // Only the messages that killed run covered are reported; later ones get a turn of their own.
-    const cut = Math.max(...prior.map((t) => ids.indexOf(t.inbound!)));
-    ids.slice(0, cut + 1).forEach((id) => attempted.add(id));
-    await reportInterrupted(deps, userId, to, ids.slice(0, cut + 1), prior.map((t) => t.id), deadline);
-    return true;
-  }
-
   ids.forEach((id) => attempted.add(id));
   if (Date.now() + MIN_TURN_MS > deadline) return false;
   try {

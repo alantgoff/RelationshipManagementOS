@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { draftQuotedBy, parseCommand, type CommandContext } from "@/agent/commands";
+import { splitMessage } from "@/agent/text";
 
 const leo = { id: "d-leo", body: "Subject: Acme\nHey Leo, want to co-invest in Acme's seed?" };
 const sam = { id: "d-sam", body: "Sam, congrats on the launch! Coffee next week?" };
@@ -103,16 +104,33 @@ describe("drafts", () => {
     expect(parseCommand("❤️", idle)).toEqual({ kind: "reaction" });
     expect(parseCommand("🙏", oneWaiting)).toEqual({ kind: "reaction" });
   });
+
+  it("a message that only starts like a tapback is a request for the model", () => {
+    expect(parseCommand('Loved "Sapiens" - Dana recommended it, remind me to thank her Friday', idle)).toBeNull();
+    expect(parseCommand("Liked 'the pitch' from Acme today, log a meeting with Sam", idle)).toBeNull();
+    expect(parseCommand("Liked “Hey Leo, want to co-invest", twoWaiting)).toBeNull();
+  });
 });
 
 describe("draftQuotedBy", () => {
   it("matches truncated quotes and ignores very short ones", () => {
-    expect(draftQuotedBy("Hey Leo, want to…", [sam, leo])?.id).toBe("d-leo");
+    expect(draftQuotedBy("Hey Leo, want to…", [sam, leo])).toBe(leo);
     expect(draftQuotedBy("Hey", [sam, leo])).toBeNull();
     expect(draftQuotedBy("Something unrelated entirely", [sam, leo])).toBeNull();
   });
-  it("needs the quote to open the draft or one of its lines, not just appear in it", () => {
+  it("needs the quote to open the draft, one of its lines or one of its bubbles, not just appear in it", () => {
     expect(draftQuotedBy("Coffee next week?", [sam, leo])).toBeNull();
     expect(draftQuotedBy("congrats on the launch", [sam, leo])).toBeNull();
+    // A long draft goes out as several bubbles; a tapback on the second quotes its start.
+    const long = { id: "d-long", body: `${"Portfolio update. ".repeat(70)}Closing thoughts on the fund.` };
+    const [, second] = splitMessage(long.body);
+    expect(draftQuotedBy(`${second.slice(0, 30)}…`, [sam, long])).toBe(long);
+  });
+  it("is ambiguous when the quote opens several drafts", () => {
+    const a = { id: "d-a", body: "Subject: LP dinner Oct 12\nHi Leo, join us?" };
+    const b = { id: "d-b", body: "Subject: LP dinner Oct 12\nHi Sam, join us?" };
+    expect(draftQuotedBy("Subject: LP dinner Oct 12…", [a, b])).toBe("ambiguous");
+    expect(parseCommand("Liked “Subject: LP dinner Oct 12…”", { drafts: [a, b], shownDraft: null, lastOutboundAsked: false })).toBeNull();
+    expect(draftQuotedBy("Hi Sam, join", [a, b])).toBe(b);
   });
 });

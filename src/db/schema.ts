@@ -192,6 +192,8 @@ export const channelMessages = pgTable(
     readyAt: timestamp("ready_at", { withTimezone: true }).defaultNow(),
     processedAt: timestamp("processed_at", { withTimezone: true }),
     error: text("error"),
+    /** Outbound drafts: the pending_actions id the message shows, so "sent" resolves exactly that draft. */
+    refId: uuid("ref_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

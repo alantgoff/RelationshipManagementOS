@@ -35,7 +35,10 @@ export type UndoOp =
       kind: "restore_lp";
       id: string;
       stage: LpStage | null;
-      roles: Role[];
+      /** Roles the tool added; undo removes only these. */
+      rolesAdded?: Role[];
+      /** Legacy rows only: the full pre-turn role list. */
+      roles?: Role[];
       commitmentUsd: number | null;
       /** State the tool left behind; undo is skipped if it changed since. */
       after?: { stage: LpStage | null; commitmentUsd: number | null };

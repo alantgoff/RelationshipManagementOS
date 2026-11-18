@@ -21,22 +21,27 @@ import { personLine, shortId } from "./tools";
  *      date and time, rolling summary of older conversation, facts about the
  *      owner, people in play, what's due, pending drafts.
  *
- * Everything is budgeted in estimated tokens so a months-long thread still
- * fits well under the spec's 20k ceiling (HA-7).
+ * Everything is budgeted in estimated tokens. The assembled prompt stays under
+ * CONTEXT_BUDGET_TOKENS, leaving room for tool results below the spec's 20k
+ * per-call ceiling (HA-7), which the turn loop enforces (LOOP_TOKEN_LIMIT).
  */
 
-export const CONTEXT_BUDGET_TOKENS = 18_000;
+export const CONTEXT_BUDGET_TOKENS = 14_000;
 /**
  * History policy: the conversation after the rolling summary's cursor is
- * replayed verbatim. When more than HISTORY_MAX messages are unsummarized, the
- * oldest are folded into the summary, keeping the newest HISTORY_KEEP. So the
- * replayed history is contiguous with the summary (nothing falls in a gap) and
- * its start only moves on a fold, which keeps the provider's prefix cache warm.
+ * replayed verbatim. Once it passes HISTORY_MAX messages or HISTORY_FOLD_TOKENS
+ * (src/agent/turn.ts), the oldest are folded into the summary after the turn,
+ * keeping a short verbatim tail. So replayed history is normally contiguous
+ * with the summary, and its start only moves on a fold, which keeps the
+ * provider's prefix cache warm. A single turn that arrives with more history
+ * than fits the budget drops its oldest messages for that turn only; the fold
+ * that follows puts them into the summary.
  */
 export const HISTORY_MAX = 24;
 export const HISTORY_KEEP = 12;
 const MAX_PEOPLE_IN_PLAY = 8;
 const MAX_FACTS_PER_PERSON = 3;
+const MAX_DRAFTS_LISTED = 8;
 /** Rough size of the tool schemas sent with every call. */
 export const TOOL_SCHEMA_TOKENS = 2_800;
 
@@ -84,12 +89,27 @@ function shortAliases(p: Pick<PersonRow, "fullName" | "preferredName">): string[
   return [...new Set([p.preferredName?.trim(), first].filter((x): x is string => Boolean(x && x.length >= 2 && x !== p.fullName.trim())))];
 }
 
+/**
+ * A name that is also a common word counts only when capitalized mid-sentence:
+ * "Will Chen" is caught by the full name, but "Will send the deck." (sentence
+ * start, capitalized by the keyboard) and "Don't" (a contraction) are words.
+ */
+function commonWordNameHit(name: string, text: string): boolean {
+  const re = new RegExp(`(^|[^\\p{L}])${escapeRe(name)}(?=$|[^\\p{L}])`, "gu");
+  for (const m of text.matchAll(re)) {
+    const at = m.index + m[1].length;
+    const before = text.slice(0, at);
+    const after = text.slice(at + name.length);
+    if (/(^|[.!?…]["”’)]?\s+|\n\s*)$/u.test(before) || /^\s*$/.test(before)) continue;
+    if (/^['’](t|ll|re|ve|d)\b/i.test(after)) continue;
+    return true;
+  }
+  return false;
+}
+
 function aliasHit(alias: string, text: string): boolean {
   const lower = alias.toLowerCase();
-  if (COMMON_WORD_NAMES.has(lower)) {
-    const capitalized = lower[0].toUpperCase() + lower.slice(1);
-    return wordRe(capitalized, true).test(text);
-  }
+  if (COMMON_WORD_NAMES.has(lower)) return commonWordNameHit(lower[0].toUpperCase() + lower.slice(1), text);
   return wordRe(alias, false).test(text);
 }
 
@@ -187,7 +207,7 @@ export async function buildWorkingSet(input: WorkingSetInput): Promise<{ text: s
     .innerJoin(people, eq(people.id, pendingActions.personId))
     .where(and(eq(pendingActions.userId, userId), eq(pendingActions.status, "pending")))
     .orderBy(desc(pendingActions.createdAt))
-    .limit(5);
+    .limit(MAX_DRAFTS_LISTED + 1);
   if (drafts.length) {
     const opening = (enc: string) => {
       try {
@@ -198,10 +218,12 @@ export async function buildWorkingSet(input: WorkingSetInput): Promise<{ text: s
         return "";
       }
     };
+    const more = drafts.length > MAX_DRAFTS_LISTED ? "\n- …and more; ask the owner which one they mean." : "";
     sections.push(
       `Drafts waiting for the owner to send (draft id, newest first):\n${drafts
+        .slice(0, MAX_DRAFTS_LISTED)
         .map((x) => `- [${shortId(x.id)}] ${x.channel} to ${x.name} (${localDate(x.createdAt, tz)}): "${opening(x.bodyEnc)}…"`)
-        .join("\n")}`,
+        .join("\n")}${more}`,
     );
   }
 
@@ -254,7 +276,17 @@ export function historyToMessages(history: StoredMessage[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   for (const m of history) {
     const role = m.direction === "in" ? "user" : "assistant";
-    const content = m.kind === "draft" ? `[Draft shown to the owner]\n${m.body}` : m.kind === "brief" ? `[Morning brief]\n${m.body}` : m.body;
+    const label =
+      m.direction === "out" && m.error
+        ? m.kind === "draft"
+          ? "[Draft NOT delivered: the owner never saw it]\n"
+          : "[NOT delivered: the owner never saw this]\n"
+        : m.kind === "draft"
+          ? "[Draft shown to the owner]\n"
+          : m.kind === "brief"
+            ? "[Morning brief]\n"
+            : "";
+    const content = `${label}${m.body}`;
     const last = out.at(-1);
     if (last && last.role === role) last.content = `${String(last.content)}\n\n${content}`;
     else out.push({ role, content });

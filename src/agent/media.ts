@@ -2,7 +2,7 @@ import type { StoredMedia } from "@/db/schema";
 import type { InboundMedia } from "@/channels/types";
 import { describeContact, parseVCards } from "@/channels/vcard";
 import { chat, providersFromEnv, type ChatResult, type ProviderConfig } from "./llm";
-import { escapeTagText } from "./text";
+import { escapeTagText, stripReasoning } from "./text";
 
 /**
  * Turns inbound attachments into text the agent can read. Provider media URLs
@@ -105,8 +105,8 @@ async function describeImage(m: InboundMedia, deps: MediaDeps, deadline: number,
     ],
     providers,
   );
-  const text = typeof res.message.content === "string" ? res.message.content.trim() : "";
-  if (!text) throw new Error("image description was empty");
+  const text = typeof res.message.content === "string" ? stripReasoning(res.message.content) : "";
+  if (!text || res.finishReason === "length") throw new Error("image description was empty or cut off");
   return text;
 }
 
@@ -171,7 +171,22 @@ export function mediaToText(media: ProcessedMedia[]): string {
     .join("\n");
 }
 
-/** The full text of an inbound message: what the owner typed, then each attachment. */
+/**
+ * The full text of an inbound message: what the owner typed, then each
+ * attachment, cut to `maxChars` without leaving an attachment block open.
+ */
 export function composeInboundText(text: string, media: ProcessedMedia[], maxChars = 12_000): string {
-  return [text.trim(), media.length ? mediaToText(media) : ""].filter(Boolean).join("\n").slice(0, maxChars);
+  const full = [text.trim(), media.length ? mediaToText(media) : ""].filter(Boolean).join("\n");
+  if (full.length <= maxChars) return full;
+  const close = "…\n</attachment>";
+  let cut = full.slice(0, maxChars - close.length);
+  const open = (cut.match(/<attachment\b/g) ?? []).length - (cut.match(/<\/attachment>/g) ?? []).length;
+  if (open > 0) {
+    // Don't end inside the opening tag itself.
+    const lastOpen = cut.lastIndexOf("<attachment");
+    if (cut.indexOf(">", lastOpen) < 0) cut = cut.slice(0, lastOpen);
+    else cut += close;
+    return cut.trimEnd();
+  }
+  return `${cut}…`;
 }

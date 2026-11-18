@@ -108,7 +108,13 @@ describe("findMentionedPeople", () => {
   });
   it("only counts first names that are common words when capitalized", () => {
     expect(findMentionedPeople(rows, [owner("I will mark it done, may as well, by grace of god")]).map((p) => p.id)).toEqual([]);
-    expect(findMentionedPeople(rows, [owner("Mark and Will said hi; Grace too")]).map((p) => p.id).sort()).toEqual(["6", "7", "8"]);
+    expect(findMentionedPeople(rows, [owner("lunch with Mark and Will; Grace too")]).map((p) => p.id).sort()).toEqual(["6", "7", "8"]);
+  });
+  it("ignores common-word names at the start of a sentence or in a contraction", () => {
+    expect(findMentionedPeople(rows, [owner("An intro call with Priya went well. Will send the deck tomorrow.")]).map((p) => p.id)).toEqual(["1"]);
+    expect(findMentionedPeople(rows, [owner("Grace period ends Friday\nMark it done")]).map((p) => p.id)).toEqual([]);
+    expect(findMentionedPeople(rows, [owner("Don't forget, Will'll call")]).map((p) => p.id)).toEqual([]);
+    expect(findMentionedPeople(rows, [owner("Will Ortiz called. Coffee with Mark's team")]).map((p) => p.id).sort()).toEqual(["6", "7"]);
   });
   it("only counts full names in the agent's own texts", () => {
     expect(findMentionedPeople(rows, [agent("Sarah should hear from you; Priya too")]).map((p) => p.id)).toEqual([]);
@@ -120,7 +126,22 @@ describe("findMentionedPeople", () => {
 });
 
 describe("historyToMessages", () => {
-  const msg = (direction: "in" | "out", body: string, kind = "chat"): StoredMessage => ({ id: body, direction, kind, body, media: [], createdAt: new Date() });
+  const msg = (direction: "in" | "out", body: string, kind = "chat", error: string | null = null): StoredMessage => ({
+    id: body,
+    direction,
+    kind,
+    body,
+    media: [],
+    createdAt: new Date(),
+    error,
+    refId: null,
+  });
+
+  it("marks replies and drafts that never reached the owner", () => {
+    const out = historyToMessages([msg("in", "draft a note to Leo"), msg("out", "Drafted it.", "chat", "not delivered"), msg("out", "Hi Leo", "draft", "not delivered")]);
+    expect(String(out[1].content)).toContain("[NOT delivered: the owner never saw this]\nDrafted it.");
+    expect(String(out[1].content)).toContain("[Draft NOT delivered: the owner never saw it]\nHi Leo");
+  });
 
   it("keeps a leading brief behind a short user line instead of dropping it", () => {
     const out = historyToMessages([msg("out", "Morning! Priya is going cold.", "brief"), msg("in", "ok")]);

@@ -216,7 +216,7 @@ async function setLpStageTool(a: Args<"set_lp_stage">, ctx: ToolContext): Promis
       kind: "restore_lp",
       id,
       stage: before.stage,
-      roles: before.roles,
+      rolesAdded: after.roles.filter((r) => !before.roles.includes(r)),
       commitmentUsd: before.commitment,
       after: { stage: after.stage, commitmentUsd: after.commitment },
     },
@@ -288,17 +288,29 @@ const IMPLEMENTATIONS: { [N in ToolName]: (a: Args<N>, ctx: ToolContext) => Prom
 /** Read-only tools are not recorded as undoable actions but still appear in `why`. */
 export const READ_ONLY_TOOLS: ReadonlySet<ToolName> = new Set(["find_people", "get_person", "whats_due", "recall"]);
 
-/** The audit copy of a call's arguments; message bodies stay only in encrypted storage. */
-function auditInput(name: string, args: Record<string, unknown> | null): Record<string, unknown> {
+/**
+ * The audit copy of a call's arguments (plaintext jsonb). Message bodies stay
+ * only in encrypted storage: for draft_message, and for any call that failed
+ * validation or named an unknown tool (where a body may sit under another
+ * key), long strings are replaced by their length.
+ */
+function auditInput(name: string, args: Record<string, unknown> | null, valid: boolean): Record<string, unknown> {
   if (!args) return {};
-  if (name === "draft_message" && typeof args.body === "string") return { ...args, body: `[${args.body.length} characters, stored encrypted]` };
-  return args;
+  if (valid && name !== "draft_message") return args;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    const keepAsIs = valid ? key !== "body" : typeof value !== "object" || value === null;
+    if (typeof value === "string" && (!keepAsIs || value.length > 80)) out[key] = `[${value.length} characters, not stored]`;
+    else out[key] = keepAsIs ? value : "[not stored]";
+  }
+  return out;
 }
 
 /** Validate and run one tool call, record it, and return text for the model. Never throws. */
 export async function executeToolCall(call: ToolCall, ctx: ToolContext): Promise<ToolOutcome> {
   const name = call.function.name;
   const args = parseToolArguments(call);
+  let valid = false;
   let outcome: ToolOutcome;
   if (!isToolName(name)) {
     outcome = { ok: false, text: `Unknown tool "${name}". Available tools: ${TOOL_NAMES.join(", ")}.`, summary: `Unknown tool ${name}` };
@@ -310,6 +322,7 @@ export async function executeToolCall(call: ToolCall, ctx: ToolContext): Promise
       const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ");
       outcome = { ok: false, text: `Invalid arguments for ${name}: ${issues}. Fix them and call again.`, summary: `${name}: invalid arguments` };
     } else {
+      valid = true;
       try {
         const impl = IMPLEMENTATIONS[name] as (a: unknown, c: ToolContext) => Promise<ToolOutcome>;
         outcome = await impl(parsed.data, ctx);
@@ -334,7 +347,7 @@ export async function executeToolCall(call: ToolCall, ctx: ToolContext): Promise
       userId: ctx.userId,
       turnId: ctx.turnId,
       tool: name,
-      input: auditInput(name, args),
+      input: auditInput(name, args, valid),
       ok: outcome.ok,
       summary: outcome.summary.slice(0, 500),
       undo: (outcome.undo as unknown as Record<string, unknown>) ?? null,

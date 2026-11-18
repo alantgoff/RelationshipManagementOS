@@ -1,6 +1,6 @@
-import { and, count, desc, eq, gte, inArray, isNotNull, isNull } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import { getDb } from "@/db/client";
-import { agentActions, agentTurns, interactions, memoryFacts, pendingActions, people, reminders } from "@/db/schema";
+import { agentActions, agentTurns, channelMessages, interactions, memoryFacts, pendingActions, people, reminders } from "@/db/schema";
 import { deleteInteraction, setFollowUpDone } from "@/server/actions/interactions";
 import { archivePerson, updatePerson } from "@/server/actions/people";
 import { deleteReminder } from "@/server/actions/reminders";
@@ -35,11 +35,20 @@ async function applyUndo(op: UndoOp, userId: string): Promise<string | null> {
       return null;
     case "delete_person": {
       const owned = and(eq(people.id, op.id), eq(people.userId, userId));
+      // History is anything that would be lost with them: interactions (including intros
+      // naming them), reminders, live facts and live drafts. Facts and drafts this same
+      // turn added were already reverted by the newer steps, so they don't count.
       const [[i], [r], [f], [d]] = await Promise.all([
-        db.select({ n: count() }).from(interactions).where(and(eq(interactions.personId, op.id), eq(interactions.userId, userId))),
+        db
+          .select({ n: count() })
+          .from(interactions)
+          .where(and(eq(interactions.userId, userId), or(eq(interactions.personId, op.id), eq(interactions.introducedPersonId, op.id)))),
         db.select({ n: count() }).from(reminders).where(and(eq(reminders.personId, op.id), eq(reminders.userId, userId))),
-        db.select({ n: count() }).from(memoryFacts).where(and(eq(memoryFacts.personId, op.id), eq(memoryFacts.userId, userId))),
-        db.select({ n: count() }).from(pendingActions).where(and(eq(pendingActions.personId, op.id), eq(pendingActions.userId, userId))),
+        db.select({ n: count() }).from(memoryFacts).where(and(eq(memoryFacts.personId, op.id), eq(memoryFacts.userId, userId), isNull(memoryFacts.validTo))),
+        db
+          .select({ n: count() })
+          .from(pendingActions)
+          .where(and(eq(pendingActions.personId, op.id), eq(pendingActions.userId, userId), inArray(pendingActions.status, ["pending", "approved"]))),
       ]);
       if (Number(i.n) + Number(r.n) + Number(f.n) + Number(d.n) > 0) {
         await archivePerson(op.id);
@@ -79,16 +88,18 @@ async function applyUndo(op: UndoOp, userId: string): Promise<string | null> {
     }
     case "restore_lp": {
       const [row] = await db
-        .select({ stage: people.lpStage, commitment: people.lpCommitmentUsd })
+        .select({ stage: people.lpStage, commitment: people.lpCommitmentUsd, roles: people.roles })
         .from(people)
         .where(and(eq(people.id, op.id), eq(people.userId, userId)));
       if (!row) return "they no longer exist";
       if (op.after && (row.stage !== op.after.stage || row.commitment !== op.after.commitmentUsd)) {
         return "left the LP stage alone because it changed since";
       }
+      // Remove only the roles the tool added; roles added since stay.
+      const roles = op.rolesAdded ? row.roles.filter((role) => !op.rolesAdded!.includes(role)) : (op.roles ?? row.roles);
       await db
         .update(people)
-        .set({ lpStage: op.stage, roles: op.roles, lpCommitmentUsd: op.commitmentUsd, updatedAt: new Date() })
+        .set({ lpStage: op.stage, roles, lpCommitmentUsd: op.commitmentUsd, updatedAt: new Date() })
         .where(and(eq(people.id, op.id), eq(people.userId, userId)));
       revalidateApp([`/people/${op.id}`]);
       return null;
@@ -168,12 +179,19 @@ export async function undoLastTurn(userId: string, now = new Date()): Promise<st
 /** Explain the most recent turn: the tools it used and what each returned. */
 export async function explainLastTurn(userId: string): Promise<string> {
   const db = getDb();
-  const [turn] = await db
-    .select({ id: agentTurns.id })
-    .from(agentTurns)
-    .where(eq(agentTurns.userId, userId))
-    .orderBy(desc(agentTurns.createdAt))
-    .limit(1);
+  const [[turn], [brief]] = await Promise.all([
+    db.select({ id: agentTurns.id, createdAt: agentTurns.createdAt }).from(agentTurns).where(eq(agentTurns.userId, userId)).orderBy(desc(agentTurns.createdAt)).limit(1),
+    db
+      .select({ createdAt: channelMessages.createdAt })
+      .from(channelMessages)
+      .where(and(eq(channelMessages.userId, userId), eq(channelMessages.direction, "out"), eq(channelMessages.kind, "brief"), isNull(channelMessages.error)))
+      .orderBy(desc(channelMessages.createdAt))
+      .limit(1),
+  ]);
+  // A brief writes no turn; don't pass off an older turn as the basis for it.
+  if (brief && (!turn || brief.createdAt > turn.createdAt)) {
+    return "My last message was your brief: it comes straight from your records (follow-ups and reminders due, and who's going cold) and didn't change anything.";
+  }
   if (!turn) return "I haven't answered anything yet.";
   const actions = await db
     .select({ tool: agentActions.tool, summary: agentActions.summary, ok: agentActions.ok, undoneAt: agentActions.undoneAt })

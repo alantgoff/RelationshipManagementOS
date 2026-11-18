@@ -1,159 +1,58 @@
-import { createHmac, randomInt } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
-import { getDb } from "@/db/client";
-import {
-  bindingFailures,
-  channelBindings,
-  channelMessages,
-  notificationLog,
-  pendingActions,
-  people,
-  userSettings,
-  type ChannelBinding,
-  type StoredMedia,
-} from "@/db/schema";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { getDb, getLockClient } from "@/db/client";
+import { channelMessages, notificationLog, pendingActions, people, userSettings, type StoredMedia } from "@/db/schema";
 import { decrypt, encrypt } from "@/lib/crypto";
 import { localDate, safeTimeZone } from "@/lib/time";
 
 /**
- * Persistence for the headless agent: phone binding, the encrypted message
- * log, agent preferences and the unprompted-message budget. Functions take an
- * explicit userId because webhook code runs before the owner is known.
+ * Persistence for the headless agent: the encrypted message log, per-owner
+ * serialization, drafts, agent preferences and the unprompted-message budget.
+ * Functions take an explicit userId because webhook code runs before the
+ * owner is known. Phone binding lives in ./binding (re-exported here).
  *
  * Inbound message lifecycle: received (row inserted) → ready (attachments
  * processed, body holds the full text) → processed (reply sent, or failed
  * with `error`). Anything stuck before "processed" is picked up by the tick.
  */
 
-export const BINDING_CODE_TTL_MS = 15 * 60_000;
-const FAILURE_WINDOW_MS = 15 * 60_000;
-/** Failed code attempts allowed per unknown number per window. */
-export const MAX_FAILURES_PER_PHONE = 5;
-/** Failed attempts across all numbers per window before every pending code is revoked. */
-export const MAX_FAILURES_GLOBAL = 30;
-
-function pepper(): string {
-  const key = process.env.RMOS_ENCRYPTION_KEY;
-  if (!key) throw new Error("RMOS_ENCRYPTION_KEY is not set");
-  return key;
-}
-
-function codeHash(code: string): string {
-  return createHmac("sha256", pepper()).update(`bind:${code}`).digest("hex");
-}
-
-function phoneHash(phone: string): string {
-  return createHmac("sha256", pepper()).update(`phone:${phone}`).digest("hex");
-}
-
-/** Create (or replace) a 6-digit code the owner texts to the line to bind their phone. */
-export async function createBindingCode(userId: string, provider: string, now = new Date()): Promise<{ code: string; expiresAt: Date }> {
-  const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
-  const expiresAt = new Date(now.getTime() + BINDING_CODE_TTL_MS);
-  await getDb()
-    .insert(channelBindings)
-    .values({ userId, provider, pendingCodeHash: codeHash(code), codeExpiresAt: expiresAt })
-    .onConflictDoUpdate({
-      target: channelBindings.userId,
-      set: { provider, pendingCodeHash: codeHash(code), codeExpiresAt: expiresAt, updatedAt: now },
-    });
-  return { code, expiresAt };
-}
-
-/** True when this unknown number, or the line as a whole, has failed too many codes recently. */
-async function bindingThrottled(phone: string, now: Date): Promise<boolean> {
-  const since = new Date(now.getTime() - FAILURE_WINDOW_MS);
-  const db = getDb();
-  const [mine] = await db
-    .select({ n: sql<number>`count(*)` })
-    .from(bindingFailures)
-    .where(and(eq(bindingFailures.phoneHash, phoneHash(phone)), gte(bindingFailures.createdAt, since)));
-  if (Number(mine?.n ?? 0) >= MAX_FAILURES_PER_PHONE) return true;
-  const [all] = await db.select({ n: sql<number>`count(*)` }).from(bindingFailures).where(gte(bindingFailures.createdAt, since));
-  return Number(all?.n ?? 0) >= MAX_FAILURES_GLOBAL;
-}
-
-async function recordBindingFailure(phone: string, now: Date): Promise<void> {
-  const db = getDb();
-  await db.insert(bindingFailures).values({ phoneHash: phoneHash(phone), createdAt: now });
-  const since = new Date(now.getTime() - FAILURE_WINDOW_MS);
-  const [all] = await db.select({ n: sql<number>`count(*)` }).from(bindingFailures).where(gte(bindingFailures.createdAt, since));
-  if (Number(all?.n ?? 0) >= MAX_FAILURES_GLOBAL) {
-    // Someone is guessing: revoke every live code; owners generate a new one in Settings.
-    await db.update(channelBindings).set({ pendingCodeHash: null, codeExpiresAt: null }).where(isNotNull(channelBindings.pendingCodeHash));
-  }
-}
-
-/**
- * Bind `phone` to whoever generated `code`, if the code is live. Single use,
- * rate limited per number and globally. A phone already bound to another
- * account is not moved.
- */
-export async function redeemBindingCode(code: string, phone: string, now = new Date()): Promise<string | null> {
-  if (!/^\d{6}$/.test(code)) return null;
-  if (await bindingThrottled(phone, now)) return null;
-  const hash = codeHash(code);
-  const db = getDb();
-  const userId = await db.transaction(async (tx) => {
-    const [pending] = await tx
-      .select()
-      .from(channelBindings)
-      .where(and(eq(channelBindings.pendingCodeHash, hash), sql`${channelBindings.codeExpiresAt} > ${now.toISOString()}::timestamptz`))
-      .limit(1);
-    if (!pending) return null;
-    const [owner] = await tx.select({ userId: channelBindings.userId }).from(channelBindings).where(eq(channelBindings.phone, phone));
-    if (owner && owner.userId !== pending.userId) return null;
-    // Conditional on the code still being pending, so two concurrent redeems can't both win.
-    const updated = await tx
-      .update(channelBindings)
-      .set({ phone, verifiedAt: now, pendingCodeHash: null, codeExpiresAt: null, updatedAt: now })
-      .where(and(eq(channelBindings.userId, pending.userId), eq(channelBindings.pendingCodeHash, hash)))
-      .returning({ userId: channelBindings.userId });
-    return updated[0]?.userId ?? null;
-  });
-  if (!userId) await recordBindingFailure(phone, now);
-  return userId;
-}
-
-export async function findOwnerByPhone(phone: string): Promise<ChannelBinding | null> {
-  const [row] = await getDb()
-    .select()
-    .from(channelBindings)
-    .where(and(eq(channelBindings.phone, phone), isNotNull(channelBindings.verifiedAt)));
-  return row ?? null;
-}
-
-export async function getBinding(userId: string): Promise<ChannelBinding | null> {
-  const [row] = await getDb().select().from(channelBindings).where(eq(channelBindings.userId, userId));
-  return row ?? null;
-}
-
-export async function listVerifiedBindings(): Promise<ChannelBinding[]> {
-  return getDb().select().from(channelBindings).where(isNotNull(channelBindings.verifiedAt));
-}
-
-export async function unbind(userId: string): Promise<void> {
-  await getDb().delete(channelBindings).where(eq(channelBindings.userId, userId));
-}
+export {
+  BINDING_CODE_TTL_MS,
+  MAX_FAILURES_GLOBAL,
+  MAX_FAILURES_PER_PHONE,
+  createBindingCode,
+  findOwnerByPhone,
+  getBinding,
+  listVerifiedBindings,
+  redeemBindingCode,
+  unbind,
+} from "./binding";
 
 /* ───────────── Per-owner serialization ───────────── */
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Run `fn` while holding a per-owner Postgres advisory lock, so one owner's
  * turns never overlap. Waits up to `waitMs`; returns null if the lock wasn't
  * free in time (whoever holds it will pick up this owner's ready messages).
+ *
+ * Each attempt is its own short transaction on the lock pool, so a waiter
+ * holds no connection between attempts, and the holder's connection never
+ * comes from the pool its own queries need.
  */
 export async function withOwnerLock<T>(userId: string, waitMs: number, fn: () => Promise<T>): Promise<T | null> {
   const key = `agent:${userId}`;
   const giveUpAt = Date.now() + Math.max(0, waitMs);
-  return getDb().transaction(async (tx) => {
-    for (;;) {
-      const [row] = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(hashtext(${key})) as locked`);
-      if (row?.locked) return fn();
-      if (Date.now() >= giveUpAt) return null;
-      await new Promise((r) => setTimeout(r, 250));
-    }
-  });
+  for (;;) {
+    const attempt = (await getLockClient().begin(async (tx) => {
+      const [row] = await tx`select pg_try_advisory_xact_lock(hashtext(${key})) as locked`;
+      if (!row?.locked) return { held: false };
+      return { held: true, value: await fn() };
+    })) as { held: boolean; value?: T };
+    if (attempt.held) return attempt.value as T;
+    if (Date.now() >= giveUpAt) return null;
+    await sleep(250);
+  }
 }
 
 /* ───────────── Messages ───────────── */
@@ -165,7 +64,14 @@ export interface StoredMessage {
   body: string;
   media: StoredMedia[];
   createdAt: Date;
+  /** Why it failed; for outbound, "not delivered" means the owner never saw it. */
+  error: string | null;
+  /** For a draft shown to the owner: the pending_actions id it shows. */
+  refId: string | null;
 }
+
+/** Outbound error for a message that never reached the owner. */
+export const NOT_DELIVERED = "not delivered";
 
 /**
  * Insert an inbound message once. Returns null if this provider message id was
@@ -217,6 +123,7 @@ export async function insertOutbound(args: {
   body: string;
   kind: string;
   error?: string;
+  refId?: string;
 }): Promise<string> {
   const [row] = await getDb()
     .insert(channelMessages)
@@ -230,6 +137,7 @@ export async function insertOutbound(args: {
       readyAt: new Date(),
       processedAt: new Date(),
       error: args.error ?? null,
+      refId: args.refId ?? null,
     })
     .returning({ id: channelMessages.id });
   return row.id;
@@ -255,10 +163,22 @@ function toStored(row: typeof channelMessages.$inferSelect): StoredMessage {
   } catch {
     body = "[unreadable message]";
   }
-  return { id: row.id, direction: row.direction, kind: row.kind, body, media: row.media, createdAt: row.createdAt };
+  return { id: row.id, direction: row.direction, kind: row.kind, body, media: row.media, createdAt: row.createdAt, error: row.error, refId: row.refId };
 }
 
-/** Ready, unprocessed inbound messages for an owner, oldest first. */
+/**
+ * How long an attachment still being read holds back the messages after it, so
+ * a photo and the text sent right after it are answered together, in order.
+ * Longer than the media budget; an older unready message was abandoned and is
+ * left to the tick.
+ */
+export const ATTACHMENT_HOLD_MS = 35_000;
+
+/**
+ * Ready, unprocessed inbound messages for an owner, oldest first, stopping at
+ * an attachment that is still being read (its own run answers it and the
+ * messages after it).
+ */
 export async function readyUnprocessed(userId: string): Promise<StoredMessage[]> {
   const rows = await getDb()
     .select()
@@ -269,11 +189,15 @@ export async function readyUnprocessed(userId: string): Promise<StoredMessage[]>
         eq(channelMessages.direction, "in"),
         isNull(channelMessages.processedAt),
         isNull(channelMessages.error),
-        isNotNull(channelMessages.readyAt),
       ),
     )
     .orderBy(asc(channelMessages.createdAt), asc(channelMessages.id));
-  return rows.map(toStored);
+  const ready: StoredMessage[] = [];
+  for (const row of rows) {
+    if (row.readyAt) ready.push(toStored(row));
+    else if (row.createdAt.getTime() > Date.now() - ATTACHMENT_HOLD_MS) break;
+  }
+  return ready;
 }
 
 /** Inbound messages received before `olderThan` that never finished, oldest first. */
@@ -311,8 +235,17 @@ export async function recentMessages(userId: string, limit: number, opts: { befo
 /** created_at has microseconds but JS Dates have milliseconds; compare at millisecond precision. */
 const afterCursor = (after: Date) => sql`date_trunc('milliseconds', ${channelMessages.createdAt}) > ${after.toISOString()}::timestamptz`;
 
+/**
+ * The conversation: the agent's messages, and the owner's once answered.
+ * Messages still queued (including the ones a turn is answering) are left out,
+ * so history never shows an owner message as unanswered that is about to be.
+ */
 function conversationWhere(userId: string, after: Date | null, before: Date | null, kinds: string[]) {
-  const where = [eq(channelMessages.userId, userId), inArray(channelMessages.kind, kinds), isNotNull(channelMessages.readyAt)];
+  const where = [
+    eq(channelMessages.userId, userId),
+    inArray(channelMessages.kind, kinds),
+    or(eq(channelMessages.direction, "out"), isNotNull(channelMessages.processedAt))!,
+  ];
   if (after) where.push(afterCursor(after));
   if (before) where.push(lt(channelMessages.createdAt, before));
   return and(...where);
@@ -320,8 +253,8 @@ function conversationWhere(userId: string, after: Date | null, before: Date | nu
 
 /**
  * Conversation messages after the summary cursor (exclusive) and before
- * `before` (exclusive), returned oldest first. `take: "newest"` keeps the
- * newest `limit` (for replay); `take: "oldest"` the oldest (for folding).
+ * `before` (exclusive, or no bound), returned oldest first. `take: "newest"`
+ * keeps the newest `limit` (for replay); `take: "oldest"` the oldest (for folding).
  */
 export async function conversationSince(
   userId: string,
@@ -352,15 +285,46 @@ export async function countConversationSince(userId: string, after: Date | null,
   return Number(row?.n ?? 0);
 }
 
-/** Kind of the agent's latest message sent before `before`, if any. */
-export async function lastOutboundKind(userId: string, before: Date): Promise<string | null> {
+/** The agent's latest message that reached the owner before `before`, if any. */
+export async function lastDeliveredOutbound(userId: string, before: Date): Promise<StoredMessage | null> {
   const [row] = await getDb()
-    .select({ kind: channelMessages.kind })
+    .select()
     .from(channelMessages)
-    .where(and(eq(channelMessages.userId, userId), eq(channelMessages.direction, "out"), lt(channelMessages.createdAt, before)))
+    .where(
+      and(eq(channelMessages.userId, userId), eq(channelMessages.direction, "out"), isNull(channelMessages.error), lt(channelMessages.createdAt, before)),
+    )
     .orderBy(desc(channelMessages.createdAt), desc(channelMessages.id))
     .limit(1);
-  return row?.kind ?? null;
+  return row ? toStored(row) : null;
+}
+
+/**
+ * Replies that never reached the owner since `since`, oldest first, skipping
+ * any already superseded by a later message that did reach them.
+ */
+export async function undeliveredReplies(userId: string, since: Date): Promise<StoredMessage[]> {
+  const rows = await getDb()
+    .select()
+    .from(channelMessages)
+    .where(
+      and(
+        eq(channelMessages.userId, userId),
+        eq(channelMessages.direction, "out"),
+        eq(channelMessages.error, NOT_DELIVERED),
+        gte(channelMessages.createdAt, since),
+        sql`not exists (select 1 from channel_messages later where later.user_id = ${userId} and later.direction = 'out' and later.error is null and later.created_at > ${channelMessages.createdAt})`,
+      ),
+    )
+    .orderBy(asc(channelMessages.createdAt), asc(channelMessages.id));
+  return rows.map(toStored);
+}
+
+/** Record the outcome of re-sending an undelivered message. */
+export async function markRedelivered(id: string, outcome: { providerMessageId?: string } | "failed"): Promise<void> {
+  await getDb()
+    .update(channelMessages)
+    .set(outcome === "failed" ? { error: `${NOT_DELIVERED} (gave up)` } : { error: null, providerMessageId: outcome.providerMessageId ?? null })
+    .where(eq(channelMessages.id, id));
 }
 
 export async function getMessage(id: string): Promise<StoredMessage | null> {

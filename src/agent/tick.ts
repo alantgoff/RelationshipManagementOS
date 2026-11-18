@@ -9,8 +9,10 @@ import {
   insertOutbound,
   listVerifiedBindings,
   markProcessed,
+  markRedelivered,
   releaseNotification,
   stuckInbound,
+  undeliveredReplies,
   unpromptedCountToday,
 } from "./store";
 import { maybeUpdateThreadSummary, SEND_RESERVE_MS, sendOut } from "./turn";
@@ -18,7 +20,8 @@ import { maybeUpdateThreadSummary, SEND_RESERVE_MS, sendOut } from "./turn";
 /**
  * The scheduled tick (cron, every ~15 minutes). Per owner, isolated so one
  * owner's failure can't stop the rest:
- *   1. recover messages a killed webhook run left behind,
+ *   1. recover messages a killed webhook run left behind, and re-send recent
+ *      replies the provider failed to deliver,
  *   2. expire stale drafts and keep the thread summary caught up,
  *   3. send the weekday morning brief once, inside its window and budget (HA-8).
  */
@@ -29,6 +32,8 @@ export const STALE_READY_MS = 2 * 60_000;
 export const STALE_UNREADY_MS = 10 * 60_000;
 /** Total real-clock budget for one tick; the cron route allows 120s. */
 export const TICK_BUDGET_MS = 100_000;
+/** Undelivered replies younger than this get one more try; older ones would arrive out of context. */
+export const REDELIVER_WINDOW_MS = 30 * 60_000;
 
 export interface BriefTickResult {
   userId: string;
@@ -37,6 +42,26 @@ export interface BriefTickResult {
   preview?: string;
   /** Abandoned messages picked back up this tick. */
   recovered?: number;
+  /** Undelivered replies re-sent this tick. */
+  redelivered?: number;
+}
+
+/** Re-send replies that never reached the owner and weren't superseded. One try each. */
+async function redeliver(deps: AgentDeps, userId: string, phone: string): Promise<number> {
+  const missed = await undeliveredReplies(userId, new Date(Date.now() - REDELIVER_WINDOW_MS));
+  let sent = 0;
+  for (const m of missed) {
+    try {
+      const { providerMessageId } = await deps.adapter.sendText(phone, m.body);
+      await markRedelivered(m.id, { providerMessageId });
+      sent++;
+    } catch (err) {
+      console.error("[agent] re-send failed", err);
+      await markRedelivered(m.id, "failed");
+      break; // keep the rest in order for the next tick
+    }
+  }
+  return sent;
 }
 
 async function recoverStuck(deps: AgentDeps, userId: string, phone: string, tickDeadline: number): Promise<number> {
@@ -66,8 +91,10 @@ export async function runBriefTick(deps: AgentDeps, opts: { dryRun?: boolean } =
       if (!binding.phone) return { userId, sent: false, skipped: "no_phone" };
       const phone = binding.phone;
       let recovered = 0;
+      let redelivered = 0;
       if (!opts.dryRun) {
         try {
+          redelivered = await redeliver(deps, userId, phone);
           recovered = await recoverStuck(deps, userId, phone, tickDeadline);
           await expireOldDrafts(userId, now);
           if (tickDeadline - Date.now() > MIN_TURN_MS) {
@@ -77,7 +104,7 @@ export async function runBriefTick(deps: AgentDeps, opts: { dryRun?: boolean } =
           console.error("[agent] tick maintenance failed", userId, err);
         }
       }
-      const withRecovered = (r: BriefTickResult): BriefTickResult => (recovered ? { ...r, recovered } : r);
+      const withRecovered = (r: BriefTickResult): BriefTickResult => ({ ...r, ...(recovered ? { recovered } : {}), ...(redelivered ? { redelivered } : {}) });
 
       const prefs = await getAgentPrefs(userId);
       const skip = briefScheduleCheck(prefs, now, await unpromptedCountToday(userId, now, prefs.timezone));

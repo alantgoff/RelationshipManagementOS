@@ -11,8 +11,9 @@ import { composeInboundText, defaultMediaDeps, MEDIA_BUDGET_MS, processMedia, st
 import {
   findOwnerByPhone,
   getAgentPrefs,
+  getBinding,
   insertInbound,
-  lastOutboundKind,
+  lastDeliveredOutbound,
   markProcessed,
   markReady,
   pendingDrafts,
@@ -37,6 +38,11 @@ export interface AgentDeps {
   now: () => Date;
   /** Our line in E.164; inbound messages addressed elsewhere are ignored. */
   lineNumber?: string;
+  /**
+   * Start a fresh run for an owner whose queue outlasted this run's budget
+   * (see src/app/api/cron/drain). Without it, the tick picks them up.
+   */
+  handOff?: (userId: string) => Promise<void>;
 }
 
 export function defaultAgentDeps(adapter: ChannelAdapter): AgentDeps {
@@ -46,6 +52,23 @@ export function defaultAgentDeps(adapter: ChannelAdapter): AgentDeps {
     media: defaultMediaDeps(),
     now: () => new Date(),
     lineNumber: process.env.SENDBLUE_FROM_NUMBER || undefined,
+    handOff: drainHandOffFromEnv(),
+  };
+}
+
+/** Hand-off over HTTP to this deployment's drain route, when it knows its own URL and the cron secret. */
+function drainHandOffFromEnv(): AgentDeps["handOff"] {
+  const secret = process.env.CRON_SECRET;
+  const base = process.env.APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+  if (!secret || !base) return undefined;
+  return async (userId) => {
+    const res = await fetch(new URL("/api/cron/drain", base), {
+      method: "POST",
+      headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+      body: JSON.stringify({ userId }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) throw new Error(`drain hand-off failed: ${res.status}`);
   };
 }
 
@@ -56,6 +79,8 @@ export function defaultAgentDeps(adapter: ChannelAdapter): AgentDeps {
 export const WORK_BUDGET_MS = 50_000;
 /** Least time left for starting a model turn; less, and the message waits for the next run or tick. */
 export const MIN_TURN_MS = 20_000;
+/** Least time left for keeping the thread summary caught up after the queue is empty. */
+const MIN_FOLD_MS = 8_000;
 
 /* ───────────── Intake ───────────── */
 
@@ -128,28 +153,55 @@ export async function processInbound(deps: AgentDeps, userId: string, messageId:
   });
 }
 
+/** Drain one owner's queue in a fresh run (the hand-off route). */
+export async function drainOwner(deps: AgentDeps, userId: string): Promise<void> {
+  const binding = await getBinding(userId);
+  if (!binding?.phone || !binding.verifiedAt) return;
+  const phone = binding.phone;
+  const deadline = Date.now() + WORK_BUDGET_MS;
+  await runAsOwner(userId, "channel", () => drainQueue(deps, userId, phone, deadline));
+}
+
 /**
- * Answer ready messages until none are left or the budget runs low. Whoever
- * holds the owner's lock also picks up messages that arrive meanwhile; a run
- * that can't get the lock in time leaves its message for the holder or the tick.
+ * Answer ready messages until none are left or the budget runs low, then keep
+ * the thread summary caught up. Whoever holds the owner's lock also picks up
+ * messages that arrive meanwhile; a run that can't get the lock in time leaves
+ * its message for the holder. A holder that runs out of budget with messages
+ * still queued hands them to a fresh run (or, failing that, to the tick).
  * Must be called inside runAsOwner.
  */
 export async function drainQueue(deps: AgentDeps, userId: string, to: string, deadline: number): Promise<void> {
   await withOwnerLock(userId, deadline - Date.now() - MIN_TURN_MS, async () => {
     const attempted = new Set<string>();
+    let folded = false;
     for (;;) {
       const ready = await readyUnprocessed(userId);
-      if (ready.length === 0 || attempted.has(ready[0].id)) return;
-      const more = await processNext(deps, userId, to, ready, deadline, attempted);
-      if (!more) return;
+      if (ready.length && !attempted.has(ready[0].id)) {
+        if (await processNext(deps, userId, to, ready, deadline, attempted)) continue;
+        break;
+      }
+      if (ready.length || folded || deadline - Date.now() < MIN_FOLD_MS) break;
+      // Queue empty: fold older conversation into the summary while there's time (HA-7).
+      folded = true;
+      await maybeUpdateThreadSummary(deps, userId, deps.now(), Math.min(15_000, deadline - Date.now() - 2_000)).catch((err) =>
+        console.error("[agent] summary update failed", err),
+      );
+    }
+    if (deps.handOff && (await readyUnprocessed(userId)).length) {
+      await deps.handOff(userId).catch((err) => console.error("[agent] hand-off failed; the tick will pick it up", err));
     }
   });
 }
 
+/** What a message means as a command, given the drafts the owner had seen when they sent it. */
 async function commandFor(userId: string, m: StoredMessage): Promise<Command | null> {
   if (m.media.length) return null; // attachments always go to the model
-  const [drafts, lastOut] = await Promise.all([pendingDrafts(userId), lastOutboundKind(userId, m.createdAt)]);
-  return parseCommand(m.body, { drafts: drafts.map((d) => ({ id: d.id, body: d.body })), lastOutboundWasDraft: lastOut === "draft" });
+  const [pending, lastOut] = await Promise.all([pendingDrafts(userId), lastDeliveredOutbound(userId, m.createdAt)]);
+  // Drafts created after this message (by a turn still catching up) aren't what it refers to.
+  const drafts = pending.filter((d) => d.createdAt < m.createdAt).map((d) => ({ id: d.id, body: d.body }));
+  const shownDraft = lastOut?.kind === "draft" && lastOut.refId ? (drafts.find((d) => d.id === lastOut.refId) ?? null) : null;
+  const lastOutboundAsked = lastOut?.kind === "chat" && /\?\s*$/.test(lastOut.body);
+  return parseCommand(m.body, { drafts, shownDraft, lastOutboundAsked });
 }
 
 /** Handle the next unit of work: one command, or one run of consecutive chat messages. Returns false to stop. */
@@ -176,16 +228,18 @@ async function processNext(deps: AgentDeps, userId: string, to: string, ready: S
     run.push(m);
   }
   const ids = run.map((m) => m.id);
-  ids.forEach((id) => attempted.add(id));
 
   // A turn already started for these messages means a previous run was killed midway.
   const prior = await getDb().select({ id: agentTurns.id, inbound: agentTurns.inboundMessageId }).from(agentTurns).where(inArray(agentTurns.inboundMessageId, ids));
   if (prior.length) {
+    // Only the messages that killed run covered are reported; later ones get a turn of their own.
     const cut = Math.max(...prior.map((t) => ids.indexOf(t.inbound!)));
+    ids.slice(0, cut + 1).forEach((id) => attempted.add(id));
     await reportInterrupted(deps, userId, to, ids.slice(0, cut + 1), prior.map((t) => t.id), deadline);
     return true;
   }
 
+  ids.forEach((id) => attempted.add(id));
   if (Date.now() + MIN_TURN_MS > deadline) return false;
   try {
     const result = await runTurn(deps, { userId, messages: run, now: deps.now(), to, deadline });
@@ -193,14 +247,11 @@ async function processNext(deps: AgentDeps, userId: string, to: string, ready: S
   } catch (err) {
     console.error("[agent] turn failed", err);
     await markProcessed(ids, { error: err instanceof Error ? err.message.slice(0, 500) : "error" });
-    await sendOut(deps, userId, to, "Sorry, something broke on my side and I may not have finished. Text \"why\" to see what I saved.", "system", deadline).catch(() => {});
-    return true;
-  }
-  // Keep the summary caught up while there's time to spare.
-  if (deadline - Date.now() > MIN_TURN_MS) {
-    await maybeUpdateThreadSummary(deps, userId, deps.now(), Math.min(15_000, deadline - Date.now() - SEND_RESERVE_MS)).catch((err) =>
-      console.error("[agent] summary update failed", err),
-    );
+    const started = await getDb().select({ id: agentTurns.id }).from(agentTurns).where(inArray(agentTurns.inboundMessageId, ids)).limit(1);
+    const text = started.length
+      ? "Sorry, something broke on my side and I may not have finished. Text \"why\" to see what I saved."
+      : "Sorry, something broke on my side before I could start, so nothing was saved. Could you send that again?";
+    await sendOut(deps, userId, to, text, "system", deadline).catch(() => {});
   }
   return true;
 }
@@ -270,12 +321,6 @@ async function runCommand(deps: AgentDeps, userId: string, m: StoredMessage, com
       if (!done) return { text: "That draft was already logged or discarded.", kind: "command" };
       await recordDraftAction(userId, m.id, "reject_draft", command.draftId, done);
       return { text: `Discarded the draft to ${done.name}.`, kind: "command" };
-    }
-    case "which_draft": {
-      const drafts = await pendingDrafts(userId);
-      const list = drafts.slice(0, 5).map((d) => `${d.channel} to ${d.name}`).join(", ");
-      const verb = command.action === "approve" ? "sent" : "want to drop";
-      return { text: `You have ${drafts.length} drafts waiting (${list}). Which one did you ${verb}? Tap 👍 on the draft itself, or tell me who it was to.`, kind: "command" };
     }
   }
 }

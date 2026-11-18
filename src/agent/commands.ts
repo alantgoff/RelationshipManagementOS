@@ -2,11 +2,13 @@
  * Commands handled by code, never by the model (spec 0002 §2), so they work
  * even when the model is down and can't be talked out of by a prompt.
  *
- * Drafts: only unambiguous signals resolve a draft here: 👍 or "sent" means
- * "I sent it" (logged as an interaction), "skip"/"discard"/👎 means drop it.
- * "yes", "looks good" and "no" are about the wording, so they go to the model,
- * which can revise the draft or call resolve_draft. A tapback resolves the
- * draft it quotes; any other tapback is just a reaction and gets no reply.
+ * Drafts: code resolves a draft only on an unambiguous signal about a draft
+ * the owner has seen. 👍 or "sent" right after a draft means "I sent it"
+ * (logged as an interaction); "skip"/👎 means drop it. A tapback resolves the
+ * draft it quotes. Anything less certain (a 👍 that may answer a question, a
+ * "sent" after the conversation moved on, "yes", "looks good") goes to the
+ * model, which sees the drafts waiting and can ask or call resolve_draft.
+ * Other tapbacks and emoji are reactions and get no reply.
  */
 
 export type Command =
@@ -19,8 +21,6 @@ export type Command =
   | { kind: "why" }
   | { kind: "approve"; draftId: string }
   | { kind: "reject"; draftId: string }
-  /** Several drafts are pending and the signal doesn't say which. */
-  | { kind: "which_draft"; action: "approve" | "reject" }
   /** A tapback or emoji that needs no reply. */
   | { kind: "reaction" };
 
@@ -30,10 +30,12 @@ export interface DraftRef {
 }
 
 export interface CommandContext {
-  /** Pending drafts, newest first. */
+  /** Pending drafts the owner had already been sent when they wrote this message, newest first. */
   drafts: DraftRef[];
-  /** True when the agent's latest message before this one was a draft. */
-  lastOutboundWasDraft: boolean;
+  /** The draft in the agent's latest delivered message, if that message was a draft still pending. */
+  shownDraft: DraftRef | null;
+  /** True when the agent's latest delivered message asked the owner something. */
+  lastOutboundAsked: boolean;
 }
 
 const MAX_PAUSE_MINUTES = 14 * 24 * 60;
@@ -73,26 +75,24 @@ const normQuote = (s: string) =>
     .trim()
     .toLowerCase();
 
-/** The pending draft a tapback quotes, if any. Quotes may be truncated, so match by prefix or containment. */
+/**
+ * The pending draft a tapback quotes, if any. iMessage quotes the start of the
+ * message, sometimes truncated, so the quote must open the draft or one of its
+ * lines (a draft may start with a "Subject:" line).
+ */
 export function draftQuotedBy(quote: string, drafts: DraftRef[]): DraftRef | null {
   const q = normQuote(quote);
   if (q.length < 6) return null;
-  return drafts.find((d) => normQuote(d.body).includes(q)) ?? null;
+  return (
+    drafts.find((d) => {
+      const lines = d.body.split("\n");
+      return lines.some((_, i) => normQuote(lines.slice(i).join(" ")).startsWith(q));
+    }) ?? null
+  );
 }
 
-/** Which draft a bare "sent"/👍/"skip" refers to: the one just shown, or the only one waiting. */
-function targetDraft(ctx: CommandContext): DraftRef | "ambiguous" | null {
-  if (ctx.drafts.length === 0) return null;
-  if (ctx.lastOutboundWasDraft || ctx.drafts.length === 1) return ctx.drafts[0];
-  return "ambiguous";
-}
-
-function resolve(action: "approve" | "reject", ctx: CommandContext, fallback: Command | null): Command | null {
-  const target = targetDraft(ctx);
-  if (!target) return fallback;
-  if (target === "ambiguous") return { kind: "which_draft", action };
-  return action === "approve" ? { kind: "approve", draftId: target.id } : { kind: "reject", draftId: target.id };
-}
+/** iMessage relays an un-tap as text, e.g. Removed a like from “…”. */
+const REMOVED_TAPBACK = new RegExp(`^removed\\s+(?:a|an)\\s+\\S+(?:\\s+\\S+)?\\s+from\\s+${QUOTE}`, "iu");
 
 export function parseCommand(raw: string, ctx: CommandContext): Command | null {
   const text = raw.trim();
@@ -125,12 +125,16 @@ export function parseCommand(raw: string, ctx: CommandContext): Command | null {
     if (draft && negative) return { kind: "reject", draftId: draft.id };
     return { kind: "reaction" };
   }
+  if (REMOVED_TAPBACK.test(text)) return { kind: "reaction" };
 
-  if (THUMBS_UP.test(text)) return resolve("approve", ctx, { kind: "reaction" });
-  if (THUMBS_DOWN.test(text)) return resolve("reject", ctx, { kind: "reaction" });
-  if (SENT_WORDS.has(norm)) return resolve("approve", ctx, null);
-  if (REJECT_WORDS.has(norm)) return resolve("reject", ctx, null);
-  if (EMOJI_ONLY.test(text)) return { kind: "reaction" };
+  const shown = ctx.shownDraft;
+  // A bare emoji is a reaction unless it might be an answer: to a question, or about a waiting draft.
+  const emojiAnswer = ctx.lastOutboundAsked || ctx.drafts.length > 0 ? null : ({ kind: "reaction" } as const);
+  if (THUMBS_UP.test(text)) return shown ? { kind: "approve", draftId: shown.id } : emojiAnswer;
+  if (THUMBS_DOWN.test(text)) return shown ? { kind: "reject", draftId: shown.id } : emojiAnswer;
+  if (SENT_WORDS.has(norm)) return shown ? { kind: "approve", draftId: shown.id } : null;
+  if (REJECT_WORDS.has(norm)) return shown ? { kind: "reject", draftId: shown.id } : null;
+  if (EMOJI_ONLY.test(text)) return ctx.lastOutboundAsked ? null : { kind: "reaction" };
   return null;
 }
 

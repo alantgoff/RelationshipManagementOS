@@ -320,6 +320,7 @@ describe("context budget and thread summary (HA-7)", () => {
         kind: "chat",
         bodyEnc: encrypt(long(k, chars)),
         createdAt: new Date(Date.UTC(2026, 8, 1, 0, k)),
+        processedAt: new Date(Date.UTC(2026, 8, 1, 0, k)),
       });
     }
   }

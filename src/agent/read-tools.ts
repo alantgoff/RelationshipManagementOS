@@ -11,16 +11,22 @@ import { personLine, resolvePerson, shortId, ToolUserError, type Args, type Tool
 
 const MAX_DUE_ITEMS = 10;
 
+/** Words of a search text: letters and digits, so "priya@acme.com" yields priya, acme, com. */
+const words = (s: string) => s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+
 export async function findPeople(a: Args<"find_people">, ctx: ToolContext): Promise<ToolOutcome> {
-  const terms = a.query.toLowerCase().split(/\s+/).filter((t) => t.length >= 2);
+  const terms = words(a.query).filter((t) => t.length >= 2);
   if (terms.length === 0) throw new ToolUserError("query is too short; give a name, company or keyword.");
   const limit = a.limit ?? 8;
   const longest = [...terms].sort((x, y) => y.length - x.length)[0];
   const candidates = await listPeople({ q: longest, role: a.role, sort: "name" }, ctx.now);
-  const haystack = (p: PersonRow) =>
-    [p.fullName, p.preferredName, p.company, p.email, p.title, p.location, ...p.tags].filter(Boolean).join(" ").toLowerCase();
-  let rows = candidates.filter((p) => terms.every((t) => haystack(p).includes(t)));
-  const partial = rows.length === 0 && terms.length > 1;
+  // Every term must start a word ("ana" finds Ana, not Diana or Managing Partner).
+  const haystack = (p: PersonRow) => words([p.fullName, p.preferredName, p.company, p.email, p.title, p.location, ...p.tags].filter(Boolean).join(" "));
+  let rows = candidates.filter((p) => {
+    const hay = haystack(p);
+    return terms.every((t) => hay.some((w) => w.startsWith(t)));
+  });
+  const partial = rows.length === 0;
   if (rows.length === 0) rows = candidates;
   if (a.health) rows = rows.filter((p) => p.health === a.health);
   if (rows.length === 0) {
@@ -123,6 +129,8 @@ export async function whatsDueTool(a: Args<"whats_due">, ctx: ToolContext): Prom
   return { ok: true, text: lines.join("\n\n"), summary: `Checked what's due (${d.attention.length} need attention)` };
 }
 
+const RECALL_LIMIT = 20;
+
 const escapeLike = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
 
 /** Search remembered facts, including older owner facts that no longer fit the context block. */
@@ -146,12 +154,18 @@ export async function recallTool(a: Args<"recall">, ctx: ToolContext): Promise<T
     .leftJoin(people, eq(people.id, memoryFacts.personId))
     .where(and(...where))
     .orderBy(desc(memoryFacts.createdAt))
-    .limit(20);
+    .limit(RECALL_LIMIT + 1);
   if (rows.length === 0) {
     return { ok: true, text: `Nothing remembered ${scope}${a.query ? ` matching "${a.query}"` : ""}.`, summary: `Recalled facts: none` };
   }
-  const lines = rows.map(
+  const shown = rows.slice(0, RECALL_LIMIT);
+  const lines = shown.map(
     (r) => `- ${r.personId ? `${r.name} [${shortId(r.personId)}]: ` : "Owner: "}${r.fact} (noted ${localDate(r.createdAt, ctx.tz)})`,
   );
-  return { ok: true, text: `Remembered facts, newest first:\n${lines.join("\n")}`, summary: `Recalled ${rows.length} fact${rows.length === 1 ? "" : "s"}` };
+  const more = rows.length > RECALL_LIMIT ? `\n…and older facts not shown; recall again with a query to search them.` : "";
+  return {
+    ok: true,
+    text: `Remembered facts, newest first:\n${lines.join("\n")}${more}`,
+    summary: `Recalled ${shown.length}${more ? "+" : ""} fact${shown.length === 1 ? "" : "s"}`,
+  };
 }

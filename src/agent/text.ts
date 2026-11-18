@@ -16,9 +16,15 @@ export function stripReasoning(text: string): string {
   return t.trim();
 }
 
-/** Strip reasoning and markdown that doesn't render in iMessage. */
+/**
+ * Strip reasoning, tool-call markup a model wrote as text (some servers keep
+ * tools in the prompt when tool_choice is "none"), and markdown that doesn't
+ * render in iMessage.
+ */
 export function cleanReply(text: string): string {
   return stripReasoning(text)
+    .replace(/<tool_call>[\s\S]*?(<\/tool_call>|$)/gi, "")
+    .replace(/<\/?tool_call>/gi, "")
     .replace(/^#{1,6}\s+/gm, "")
     .replace(/\*\*(.+?)\*\*/g, "$1")
     .replace(/__(.+?)__/g, "$1")
